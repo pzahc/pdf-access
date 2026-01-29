@@ -258,7 +258,48 @@ def analyze_document(pdf_path: Path | str) -> Dict[str, Any]:
 
     for page_num in range(len(doc)):
         page = doc[page_num]
-        page_data = {"number": page_num, "elements": []}
+        page_data = {"number": page_num, "elements": [], "tables": []}
+
+        # Detect tables first so we can exclude table text from regular text flow
+        table_bboxes = []
+        try:
+            tables = page.find_tables()
+            for table in tables.tables:
+                table_data = {
+                    "bbox": table.bbox,
+                    "rows": [],
+                    "row_count": table.row_count,
+                    "col_count": table.col_count,
+                }
+                table_bboxes.append(table.bbox)
+
+                # Extract table content
+                extracted = table.extract()
+                for row_idx, row in enumerate(extracted):
+                    row_data = {
+                        "cells": [],
+                        "is_header": row_idx == 0,  # First row is typically header
+                    }
+                    for cell in row:
+                        row_data["cells"].append(cell if cell else "")
+                    table_data["rows"].append(row_data)
+
+                page_data["tables"].append(table_data)
+        except Exception:
+            pass  # Table detection not available or failed
+
+        def is_in_table(bbox):
+            """Check if a bbox overlaps with any detected table."""
+            for tb in table_bboxes:
+                # Check overlap
+                if (
+                    bbox[0] < tb[2]
+                    and bbox[2] > tb[0]
+                    and bbox[1] < tb[3]
+                    and bbox[3] > tb[1]
+                ):
+                    return True
+            return False
 
         blocks = page.get_text("dict")["blocks"]
 
@@ -268,32 +309,35 @@ def analyze_document(pdf_path: Path | str) -> Dict[str, Any]:
                     for span in line.get("spans", []):
                         size = round(span["size"], 1)
                         text = span["text"].strip()
-                        if text:
+                        bbox = span["bbox"]
+                        if text and not is_in_table(bbox):
                             analysis["font_sizes"].add(size)
                             page_data["elements"].append(
                                 {
                                     "type": "text",
                                     "text": text,
                                     "size": size,
-                                    "bbox": span["bbox"],
+                                    "bbox": bbox,
                                 }
                             )
             elif block["type"] == 1:  # image
-                page_data["elements"].append(
-                    {
-                        "type": "image",
-                        "bbox": block["bbox"],
-                        "width": block["width"],
-                        "height": block["height"],
-                    }
-                )
-                analysis["images"].append(
-                    {
-                        "page": page_num + 1,
-                        "width": block["width"],
-                        "height": block["height"],
-                    }
-                )
+                bbox = block["bbox"]
+                if not is_in_table(bbox):
+                    page_data["elements"].append(
+                        {
+                            "type": "image",
+                            "bbox": bbox,
+                            "width": block["width"],
+                            "height": block["height"],
+                        }
+                    )
+                    analysis["images"].append(
+                        {
+                            "page": page_num + 1,
+                            "width": block["width"],
+                            "height": block["height"],
+                        }
+                    )
 
         analysis["pages"].append(page_data)
 
@@ -733,13 +777,23 @@ def make_accessible(
             )
 
         # If preserving structure, skip MCID injection and structure tree creation
-        # But still ensure tab order is set on all pages
+        # But still ensure tab order is set on all pages and annotations are tagged
         if preserve_structure:
+            struct_parent_idx = 0
             for page_num, page in enumerate(pdf.pages):
                 if page.get("/Tabs") != pikepdf.Name("/S"):
                     page.Tabs = pikepdf.Name("/S")
                 if page.get("/StructParents") is None:
                     page.StructParents = page_num
+                struct_parent_idx = max(struct_parent_idx, page_num + 1)
+
+                # Handle annotations (links, etc.) for tab order
+                annots = page.get("/Annots")
+                if annots:
+                    for annot in annots:
+                        if annot.get("/StructParent") is None:
+                            annot["/StructParent"] = struct_parent_idx
+                            struct_parent_idx += 1
             pdf.save(str(output_path))
             return title
 
@@ -805,6 +859,74 @@ def make_accessible(
                 page_struct_elems.append(struct_elem)
                 all_struct_elems.append(struct_elem)
 
+            # Create table structure elements
+            # Tables are structure-only (no MCIDs) - they organize existing content
+            for table_data in page_analysis.get("tables", []):
+                table_rows = []
+
+                for row_data in table_data["rows"]:
+                    row_cells = []
+                    for cell_idx, cell_text in enumerate(row_data["cells"]):
+                        # Create TH for header row, TD for data rows
+                        cell_tag = "TH" if row_data["is_header"] else "TD"
+                        cell_elem = pdf.make_indirect(
+                            pikepdf.Dictionary(
+                                {
+                                    "/Type": pikepdf.Name("/StructElem"),
+                                    "/S": pikepdf.Name(f"/{cell_tag}"),
+                                    "/Pg": page.obj,
+                                    # For TH, add Scope attribute (Column scope)
+                                    **(
+                                        {
+                                            "/A": pikepdf.Dictionary(
+                                                {
+                                                    "/O": pikepdf.Name("/Table"),
+                                                    "/Scope": pikepdf.Name("/Column"),
+                                                }
+                                            )
+                                        }
+                                        if row_data["is_header"]
+                                        else {}
+                                    ),
+                                }
+                            )
+                        )
+                        row_cells.append(cell_elem)
+
+                    # Create TR (table row) containing the cells
+                    tr_elem = pdf.make_indirect(
+                        pikepdf.Dictionary(
+                            {
+                                "/Type": pikepdf.Name("/StructElem"),
+                                "/S": pikepdf.Name("/TR"),
+                                "/Pg": page.obj,
+                                "/K": pikepdf.Array(row_cells),
+                            }
+                        )
+                    )
+                    # Set parent reference for cells
+                    for cell in row_cells:
+                        cell["/P"] = tr_elem
+                    table_rows.append(tr_elem)
+
+                # Create Table element containing the rows
+                if table_rows:
+                    table_elem = pdf.make_indirect(
+                        pikepdf.Dictionary(
+                            {
+                                "/Type": pikepdf.Name("/StructElem"),
+                                "/S": pikepdf.Name("/Table"),
+                                "/Pg": page.obj,
+                                "/K": pikepdf.Array(table_rows),
+                            }
+                        )
+                    )
+                    # Set parent reference for rows
+                    for tr in table_rows:
+                        tr["/P"] = table_elem
+
+                    all_struct_elems.append(table_elem)
+
             # Add to ParentTree: page_num -> array of struct elems by MCID order
             if page_struct_elems:
                 parent_tree_nums.append(page_num)
@@ -814,6 +936,41 @@ def make_accessible(
             page.Tabs = pikepdf.Name("/S")
             # Link page to its ParentTree entry
             page.StructParents = page_num
+
+            # Handle annotations (links, form fields, etc.)
+            annots = page.get("/Annots")
+            if annots:
+                for annot_idx, annot in enumerate(annots):
+                    # Calculate unique StructParent index for this annotation
+                    # Pages use indices 0 to len(pages)-1, annotations start after
+                    annot_struct_parent = len(pdf.pages) + len(all_struct_elems)
+
+                    # Create a Link structure element for this annotation
+                    annot_subtype = str(annot.get("/Subtype", ""))
+                    if "Link" in annot_subtype:
+                        link_elem = pdf.make_indirect(
+                            pikepdf.Dictionary(
+                                {
+                                    "/Type": pikepdf.Name("/StructElem"),
+                                    "/S": pikepdf.Name("/Link"),
+                                    "/Pg": page.obj,
+                                    "/K": pikepdf.Dictionary(
+                                        {
+                                            "/Type": pikepdf.Name("/OBJR"),
+                                            "/Obj": annot,
+                                        }
+                                    ),
+                                }
+                            )
+                        )
+                        all_struct_elems.append(link_elem)
+
+                        # Add to ParentTree for this annotation
+                        parent_tree_nums.append(annot_struct_parent)
+                        parent_tree_nums.append(link_elem)
+
+                        # Set StructParent on the annotation
+                        annot["/StructParent"] = annot_struct_parent
 
         # Create Document element
         doc_elem = pdf.make_indirect(
@@ -835,6 +992,26 @@ def make_accessible(
             pikepdf.Dictionary({"/Nums": pikepdf.Array(parent_tree_nums)})
         )
 
+        # Create RoleMap to map our tags to standard PDF structure types
+        # This ensures compatibility with various PDF readers
+        role_map = pdf.make_indirect(
+            pikepdf.Dictionary(
+                {
+                    "/Document": pikepdf.Name("/Document"),
+                    "/H1": pikepdf.Name("/H1"),
+                    "/H2": pikepdf.Name("/H2"),
+                    "/H3": pikepdf.Name("/H3"),
+                    "/P": pikepdf.Name("/P"),
+                    "/Figure": pikepdf.Name("/Figure"),
+                    "/Link": pikepdf.Name("/Link"),
+                    "/Table": pikepdf.Name("/Table"),
+                    "/TR": pikepdf.Name("/TR"),
+                    "/TH": pikepdf.Name("/TH"),
+                    "/TD": pikepdf.Name("/TD"),
+                }
+            )
+        )
+
         # Create StructTreeRoot
         struct_tree_root = pdf.make_indirect(
             pikepdf.Dictionary(
@@ -843,6 +1020,7 @@ def make_accessible(
                     "/K": doc_elem,
                     "/ParentTree": parent_tree,
                     "/ParentTreeNextKey": len(pdf.pages),
+                    "/RoleMap": role_map,
                 }
             )
         )
@@ -936,6 +1114,11 @@ def process_pdf(input_path: Path, force: bool = False) -> int:
     if not has_display_title:
         print("  - Enabling display document title")
     print(f"Saving: {output_path}")
+
+    # Report table detection
+    total_tables = sum(len(p.get("tables", [])) for p in analysis["pages"])
+    if total_tables > 0:
+        print(f"  - Found {total_tables} table(s) (auto-tagged with headers)")
 
     # Handle images
     total_images = len(analysis["images"])
