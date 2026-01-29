@@ -446,7 +446,89 @@ def generate_alt_text_markdown(
     with open(md_path, "w") as f:
         f.write("\n".join(lines))
 
+    # Also generate an HTML version for users without markdown viewers
+    html_path = output_dir / "alt_text.html"
+    _generate_alt_text_html(pdf_name, analysis, images, output_dir, html_path)
+
     return md_path
+
+
+def _generate_alt_text_html(
+    pdf_name: str,
+    analysis: Dict[str, Any],
+    images: List[Dict[str, Any]],
+    output_dir: Path,
+    html_path: Path,
+) -> None:
+    """Generate an HTML file showing images for alt text reference."""
+    html_lines = [
+        "<!DOCTYPE html>",
+        "<html lang='en'>",
+        "<head>",
+        "    <meta charset='UTF-8'>",
+        "    <meta name='viewport' content='width=device-width, initial-scale=1.0'>",
+        f"    <title>Alt Text for {pdf_name}</title>",
+        "    <style>",
+        "        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }",
+        "        h1 { color: #333; }",
+        "        .image-card { border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin: 20px 0; background: #fafafa; }",
+        "        .image-card img { max-width: 100%; height: auto; border: 1px solid #ccc; }",
+        "        .image-card h2 { margin-top: 0; color: #555; }",
+        "        .caption { background: #e8f4e8; padding: 10px; border-radius: 4px; margin: 10px 0; }",
+        "        .alt-text-field { width: 100%; padding: 10px; font-size: 14px; border: 1px solid #ccc; border-radius: 4px; margin-top: 10px; }",
+        "        .instructions { background: #fff3cd; padding: 15px; border-radius: 8px; margin-bottom: 20px; }",
+        "        label { font-weight: bold; color: #333; }",
+        "    </style>",
+        "</head>",
+        "<body>",
+        f"    <h1>Alt Text for {pdf_name}</h1>",
+        "    <div class='instructions'>",
+        "        <p><strong>Instructions:</strong> Review each image below and write a description in the corresponding field in <code>alt_text.md</code>.</p>",
+        "        <p>This HTML file is for <em>reference only</em> - edit the markdown file to apply changes.</p>",
+        "    </div>",
+    ]
+
+    image_num = 0
+    for page_data in analysis["pages"]:
+        elements = page_data["elements"]
+        for i, elem in enumerate(elements):
+            if elem["type"] == "image" and image_num < len(images):
+                img = images[image_num]
+                caption = find_image_caption(elements, i)
+
+                html_lines.append(f"    <div class='image-card'>")
+                html_lines.append(
+                    f"        <h2>Image {image_num + 1} (Page {img['page']})</h2>"
+                )
+                html_lines.append(
+                    f"        <img src='images/{img['filename']}' alt='Image {image_num + 1}'>"
+                )
+
+                if caption:
+                    html_lines.append(
+                        f"        <div class='caption'><strong>Auto-detected caption:</strong> {caption}</div>"
+                    )
+
+                html_lines.append(
+                    f"        <label>Alt text to add in markdown:</label>"
+                )
+                placeholder = caption if caption else "[Describe this image]"
+                html_lines.append(
+                    f"        <input type='text' class='alt-text-field' value='{placeholder}' readonly>"
+                )
+                html_lines.append(f"    </div>")
+
+                image_num += 1
+
+    html_lines.extend(
+        [
+            "</body>",
+            "</html>",
+        ]
+    )
+
+    with open(html_path, "w") as f:
+        f.write("\n".join(html_lines))
 
 
 def parse_alt_text_markdown(md_path: Path | str) -> Dict[str, Any]:
@@ -651,7 +733,13 @@ def make_accessible(
             )
 
         # If preserving structure, skip MCID injection and structure tree creation
+        # But still ensure tab order is set on all pages
         if preserve_structure:
+            for page_num, page in enumerate(pdf.pages):
+                if page.get("/Tabs") != pikepdf.Name("/S"):
+                    page.Tabs = pikepdf.Name("/S")
+                if page.get("/StructParents") is None:
+                    page.StructParents = page_num
             pdf.save(str(output_path))
             return title
 
@@ -787,19 +875,29 @@ def process_pdf(input_path: Path, force: bool = False) -> int:
 
     # Extract what's already good from pre-check
     has_mcids = flags.get("mcids", False)
+    has_tagged = flags.get("tagged", False)
     has_lang = flags.get("language", False)
     has_title = flags.get("title", False)
     has_display_title = flags.get("display_title", False)
 
-    # Check if PDF already has MCIDs - if so, only fix metadata, don't rebuild structure
-    preserve_structure = has_mcids and not force
+    # Preserve existing structure if:
+    # - PDF has MCIDs (fully tagged), OR
+    # - PDF is tagged and has figures with alt text (partial tagging, e.g., Pages export)
+    # Use --force to override and rebuild from scratch
+    has_existing_alt_text = pre_results.get("figures_with_alt", 0) > 0
+    preserve_structure = (
+        has_mcids or (has_tagged and has_existing_alt_text)
+    ) and not force
 
     # Report current status
     if pre_results["summary"]["failed"] == 0 and pre_results["summary"]["warned"] == 0:
         print("  ✓ PDF is already fully accessible!")
     else:
-        if has_mcids:
-            print("  ✓ Has MCIDs (preserving existing structure)")
+        if preserve_structure:
+            if has_mcids:
+                print("  ✓ Has MCIDs (preserving existing structure)")
+            elif has_existing_alt_text:
+                print("  ✓ Has existing alt text (preserving existing structure)")
         if has_lang:
             print("  ✓ Has language set")
         if has_title:
@@ -900,10 +998,12 @@ def process_pdf(input_path: Path, force: bool = False) -> int:
 
     if needs_review > 0:
         md_path = review_dir / "alt_text.md"
+        html_path = review_dir / "alt_text.html"
         print()
-        print(f"Images need alt text review. Edit and re-run:")
-        print(f"  1. Edit: {md_path}")
-        print(f"  2. Run:  uv run pdf_access.py {md_path}")
+        print(f"Images need alt text review:")
+        print(f"  - View images: {html_path}")
+        print(f"  - Edit alt text: {md_path}")
+        print(f"  - Then run: uv run pdf_access.py {md_path}")
     elif total_images > 0:
         print()
         print("All images have captions - no manual alt text needed!")
