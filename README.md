@@ -1,12 +1,18 @@
 # PDF Accessibility Tool
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/) [![Made with pikepdf](https://img.shields.io/badge/made%20with-pikepdf-green.svg)](https://pikepdf.readthedocs.io/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/) [![uv](https://img.shields.io/badge/uv-run-blueviolet.svg)](https://docs.astral.sh/uv/) [![Made with pikepdf](https://img.shields.io/badge/made%20with-pikepdf-green.svg)](https://pikepdf.readthedocs.io/)
 
 A free tool to make PDFs accessible for screen readers. Automatically tags document structure and provides a markdown-based workflow for adding image alt text.
 
 ## Quick Start
 
-Install [uv](https://docs.astral.sh/uv/), then:
+Install [uv](https://docs.astral.sh/uv/), then grab the script:
+
+```bash
+curl -O https://raw.githubusercontent.com/pzahc/pdf-access/main/pdf_access.py
+```
+
+Run it:
 
 ```bash
 uv run pdf_access.py document.pdf        # Process a PDF

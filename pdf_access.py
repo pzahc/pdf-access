@@ -694,24 +694,59 @@ def gather_accessibility_info(pdf_path: Path) -> Dict[str, Any]:
     # === Advanced PDF/UA Checks ===
     has_mcids = False
 
+    def is_mcid_value(val):
+        """Check if value is an MCID (integer or pikepdf integer)."""
+        try:
+            int(val)
+            return not hasattr(val, "get")  # Not a dict
+        except (TypeError, ValueError):
+            return False
+
+    def is_array(val):
+        """Check if value is a pikepdf Array (iterable but not dict/str)."""
+        if isinstance(val, (str, bytes)):
+            return False
+        if not hasattr(val, "__iter__"):
+            return False
+        # pikepdf dicts have .get(), arrays don't (they have .append())
+        return hasattr(val, "append") or not hasattr(val, "get")
+
     def check_mcids(elem):
         nonlocal has_mcids
+        if has_mcids:
+            return
         if not hasattr(elem, "get"):
             return
 
         kids = elem.get("/K")
-        if kids:
-            if hasattr(kids, "__iter__") and not isinstance(kids, (str, bytes)):
-                for kid in kids:
-                    if hasattr(kid, "get"):
-                        if kid.get("/MCID") is not None or kid.get("/Type") == "/MCR":
-                            has_mcids = True
-                            return
-                        check_mcids(kid)
-            elif hasattr(kids, "get"):
-                if kids.get("/MCID") is not None:
+        if kids is None:
+            return
+
+        # /K can be: integer (MCID), dict with /MCID, or array of these
+        # Check if /K is an integer (direct MCID reference)
+        if is_mcid_value(kids):
+            has_mcids = True
+            return
+
+        # /K is an array
+        if is_array(kids):
+            for kid in kids:
+                if is_mcid_value(kid):
                     has_mcids = True
                     return
+                if hasattr(kid, "get"):
+                    if kid.get("/MCID") is not None or kid.get("/Type") == "/MCR":
+                        has_mcids = True
+                        return
+                    check_mcids(kid)
+            return
+
+        # /K is a dictionary with /MCID or a struct elem
+        if hasattr(kids, "get"):
+            if kids.get("/MCID") is not None or kids.get("/Type") == "/MCR":
+                has_mcids = True
+                return
+            check_mcids(kids)
 
     if struct_tree:
         doc_elem = struct_tree.get("/K")
