@@ -548,7 +548,28 @@ def save_check_report(results: Dict[str, Any], report_path: Path, label: str) ->
         f.write(f"```\n{report}\n```\n")
 
 
-def process_pdf(input_path: Path) -> int:
+def is_already_accessible(results: Dict[str, Any]) -> bool:
+    """Check if a PDF is already well-tagged with MCIDs."""
+    # Check for key indicators of a well-tagged PDF
+    checks = results.get("checks", [])
+
+    has_mcids = False
+    has_parent_tree = False
+    has_struct_tree = False
+
+    for status, category, message in checks:
+        if "Content marked with MCIDs" in message and status == "pass":
+            has_mcids = True
+        if "Parent tree: Present" in message and status == "pass":
+            has_parent_tree = True
+        if "Structure tree: Present" in message and status == "pass":
+            has_struct_tree = True
+
+    # Consider it already accessible if it has MCIDs and ParentTree
+    return has_mcids and has_parent_tree and has_struct_tree
+
+
+def process_pdf(input_path: Path, force: bool = False) -> int:
     """Process a PDF file to make it accessible."""
     output_path = input_path.parent / f"{input_path.stem}_accessible.pdf"
     review_dir = input_path.parent / f"{input_path.stem}_review"
@@ -556,6 +577,19 @@ def process_pdf(input_path: Path) -> int:
     # Run pre-check
     print("Checking current accessibility status...")
     pre_results = gather_accessibility_info(input_path)
+
+    # Check if already accessible
+    if is_already_accessible(pre_results) and not force:
+        print()
+        print("This PDF is already well-tagged with MCIDs and structure.")
+        print(f"  - Passed: {pre_results['summary']['passed']}")
+        print(f"  - Warnings: {pre_results['summary']['warned']}")
+        print(f"  - Failed: {pre_results['summary']['failed']}")
+        print()
+        print("No processing needed. Use --force to override and reprocess.")
+        print(f"Run: uv run pdf_access.py --check {input_path}")
+        return 0
+
     print(f"  - Found {pre_results['summary']['failed']} issue(s) to fix")
     print()
 
@@ -1134,11 +1168,14 @@ def main() -> int:
     # Parse arguments
     args = sys.argv[1:]
     check_mode = False
+    force_mode = False
     input_path = None
 
     for arg in args:
         if arg in ("--check", "-c"):
             check_mode = True
+        elif arg in ("--force", "-f"):
+            force_mode = True
         elif not arg.startswith("-"):
             input_path = arg
 
@@ -1168,7 +1205,7 @@ def main() -> int:
         if input_file.suffix.lower() == ".md":
             return process_markdown(input_file)
         elif input_file.suffix.lower() == ".pdf":
-            return process_pdf(input_file)
+            return process_pdf(input_file, force=force_mode)
         else:
             print(f"Error: Unsupported file type: {input_file.suffix}")
             print("Supported: .pdf, .md")
