@@ -79,6 +79,14 @@ Summary:
   ✓ Passed: 7  ⚠ Warnings: 3  ✗ Failed: 0
 ```
 
+## Testing
+
+Run the test suite:
+
+```bash
+uv run --with pytest pytest test_pdf_access.py
+```
+
 ## Limitations
 
 - **Font-based heading detection** - Works best with consistent styles.

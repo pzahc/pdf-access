@@ -5,10 +5,15 @@
 __pycache__/
 *.py[cod]
 .ruff_cache/
+.pytest_cache/
 
 # Test outputs (generated files)
 *_accessible.pdf
 *_review/
+
+# Test PDFs (keep test_document.pdf as reference)
+test_fresh*.pdf
+test_mcid_output.pdf
 
 # Research notes (not for public repo)
 research*/

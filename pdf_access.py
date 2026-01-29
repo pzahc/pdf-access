@@ -24,6 +24,197 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
+import fitz
+import pikepdf
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+KNOWN_TAGS = ["Document", "H1", "H2", "H3", "P", "Figure", "Table", "L", "LI"]
+CATEGORIES = [
+    "Document Settings",
+    "Fonts",
+    "Document Structure",
+    "Images & Alt Text",
+    "Advanced (PDF/UA)",
+]
+
+
+# ============================================================================
+# pikepdf helpers (type checking for PDF objects)
+# ============================================================================
+
+
+def is_mcid_value(val) -> bool:
+    """Check if value is an MCID (integer, not a dict)."""
+    try:
+        int(val)
+        return not hasattr(val, "get")
+    except (TypeError, ValueError):
+        return False
+
+
+def is_pdf_array(val) -> bool:
+    """Check if value is a pikepdf Array (iterable but not dict/str)."""
+    if isinstance(val, (str, bytes)):
+        return False
+    if not hasattr(val, "__iter__"):
+        return False
+    return hasattr(val, "append") or not hasattr(val, "get")
+
+
+def is_struct_elem(elem) -> bool:
+    """Check if element is a structure element (has /S tag)."""
+    if not hasattr(elem, "get"):
+        return False
+    try:
+        return elem.get("/S") is not None
+    except (TypeError, ValueError):
+        return False
+
+
+def _count_structure_tags(struct_tree) -> Dict[str, Any]:
+    """
+    Count all structure tags and analyze figure alt text in a structure tree.
+    Returns dict with 'tag_counts', 'figures_with_alt', 'figures_with_placeholder', 'figures_without_alt'.
+    """
+    result = {
+        "tag_counts": {},
+        "figures_with_alt": 0,
+        "figures_with_placeholder": 0,
+        "figures_without_alt": 0,
+    }
+    tag_counts = result["tag_counts"]
+
+    def count_elem(elem):
+        if not hasattr(elem, "get"):
+            return
+
+        try:
+            tag = str(elem.get("/S", "")).replace("/", "")
+        except (TypeError, ValueError):
+            return
+
+        if tag:
+            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+            if tag == "Figure":
+                alt = elem.get("/Alt")
+                if alt:
+                    alt_str = str(alt)
+                    if "alt text needed" in alt_str.lower() or alt_str == "":
+                        result["figures_with_placeholder"] += 1
+                    else:
+                        result["figures_with_alt"] += 1
+                else:
+                    result["figures_without_alt"] += 1
+
+        try:
+            kids = elem.get("/K")
+        except (TypeError, ValueError):
+            return
+
+        if kids is None:
+            return
+
+        if is_pdf_array(kids):
+            try:
+                for kid in kids:
+                    count_elem(kid)
+            except (TypeError, ValueError):
+                pass
+        else:
+            count_elem(kids)
+
+    # Start from the root /K element
+    doc_elem = struct_tree.get("/K")
+    if doc_elem is not None:
+        if is_struct_elem(doc_elem):
+            count_elem(doc_elem)
+        elif is_pdf_array(doc_elem):
+            try:
+                for elem in doc_elem:
+                    count_elem(elem)
+            except (TypeError, ValueError):
+                pass
+
+    return result
+
+
+def _check_for_mcids(struct_tree) -> bool:
+    """
+    Check if a structure tree contains any MCIDs (content linked to structure).
+    Returns True if MCIDs are found.
+    """
+    found_mcid = False
+
+    def check_elem(elem):
+        nonlocal found_mcid
+        if found_mcid or not hasattr(elem, "get"):
+            return
+
+        try:
+            kids = elem.get("/K")
+        except (TypeError, ValueError):
+            return
+
+        if kids is None:
+            return
+
+        # /K can be: integer (MCID), dict with /MCID, or array of these
+        if is_mcid_value(kids):
+            found_mcid = True
+            return
+
+        if is_pdf_array(kids):
+            try:
+                for kid in kids:
+                    if is_mcid_value(kid):
+                        found_mcid = True
+                        return
+                    if hasattr(kid, "get"):
+                        try:
+                            if (
+                                kid.get("/MCID") is not None
+                                or kid.get("/Type") == "/MCR"
+                            ):
+                                found_mcid = True
+                                return
+                        except (TypeError, ValueError):
+                            pass
+                        check_elem(kid)
+                        if found_mcid:
+                            return
+            except (TypeError, ValueError):
+                pass
+            return
+
+        # /K is a dictionary with /MCID or a struct elem
+        if hasattr(kids, "get"):
+            if kids.get("/MCID") is not None or kids.get("/Type") == "/MCR":
+                found_mcid = True
+                return
+            check_elem(kids)
+
+    # Start from the root /K element
+    doc_elem = struct_tree.get("/K")
+    if doc_elem is None:
+        return False
+
+    if is_struct_elem(doc_elem):
+        check_elem(doc_elem)
+    elif is_pdf_array(doc_elem):
+        try:
+            for elem in doc_elem:
+                check_elem(elem)
+                if found_mcid:
+                    break
+        except (TypeError, ValueError):
+            pass
+
+    return found_mcid
+
 
 def select_pdf_file() -> Optional[str]:
     """Open a file picker dialog and return the selected PDF path."""
@@ -43,17 +234,21 @@ def select_pdf_file() -> Optional[str]:
         root.destroy()
         return file_path if file_path else None
     except Exception as e:
-        print(f"Could not open file picker: {e}")
+        print(f"Error opening file picker: {e}")
         print("\nYou can also run with a file path argument:")
         print("  uv run pdf_access.py /path/to/your/file.pdf\n")
         return None
 
 
-def analyze_document(pdf_path: str) -> Dict[str, Any]:
-    """Analyze PDF content to determine structure using pymupdf."""
-    import fitz
+def analyze_document(pdf_path: Path | str) -> Dict[str, Any]:
+    """
+    Analyze PDF content to determine structure using pymupdf.
 
-    doc = fitz.open(pdf_path)
+    Args:
+        pdf_path: Path to the PDF file.
+    """
+    pdf_path = Path(pdf_path) if not isinstance(pdf_path, Path) else pdf_path
+    doc = fitz.open(str(pdf_path))
 
     analysis = {
         "pages": [],
@@ -161,15 +356,13 @@ def find_image_caption(elements: List[Dict], image_index: int) -> Optional[str]:
     return None
 
 
-def extract_images(pdf_path: str, output_dir: Path) -> List[Dict[str, Any]]:
+def extract_images(pdf_path: Path | str, output_dir: Path) -> List[Dict[str, Any]]:
     """Extract all images from PDF."""
-    import fitz
-
     images_dir = output_dir / "images"
     images_dir.mkdir(exist_ok=True)
 
     image_list = []
-    doc = fitz.open(pdf_path)
+    doc = fitz.open(str(pdf_path))
 
     for page_num in range(len(doc)):
         page = doc[page_num]
@@ -196,15 +389,15 @@ def extract_images(pdf_path: str, output_dir: Path) -> List[Dict[str, Any]]:
                         "filename": image_filename,
                     }
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Warning: Failed to extract image on page {page_num + 1}: {e}")
 
     doc.close()
     return image_list
 
 
 def generate_alt_text_markdown(
-    pdf_path: str,
+    pdf_path: Path | str,
     analysis: Dict[str, Any],
     images: List[Dict[str, Any]],
     output_dir: Path,
@@ -256,7 +449,7 @@ def generate_alt_text_markdown(
     return md_path
 
 
-def parse_alt_text_markdown(md_path: str) -> Dict[str, Any]:
+def parse_alt_text_markdown(md_path: Path | str) -> Dict[str, Any]:
     """Parse the markdown file to extract alt text entries."""
     with open(md_path, "r") as f:
         content = f.read()
@@ -288,11 +481,9 @@ def parse_alt_text_markdown(md_path: str) -> Dict[str, Any]:
     }
 
 
-def apply_alt_text_to_pdf(pdf_path: str, alt_texts: Dict[int, str]) -> None:
+def apply_alt_text_to_pdf(pdf_path: Path | str, alt_texts: Dict[int, str]) -> None:
     """Apply alt text from markdown to the PDF structure."""
-    import pikepdf
-
-    with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
+    with pikepdf.open(str(pdf_path), allow_overwriting_input=True) as pdf:
         if "/StructTreeRoot" not in pdf.Root:
             raise ValueError("PDF has no structure tree - run accessibility tool first")
 
@@ -307,7 +498,7 @@ def apply_alt_text_to_pdf(pdf_path: str, alt_texts: Dict[int, str]) -> None:
                 if figure_num in alt_texts:
                     child["/Alt"] = pikepdf.String(alt_texts[figure_num])
 
-        pdf.save(pdf_path)
+        pdf.save(str(pdf_path))
 
 
 def inject_mcids_into_page(
@@ -321,8 +512,6 @@ def inject_mcids_into_page(
     Inject BDC/EMC markers into a page's content stream.
     Returns (mcid_info_list, next_mcid) where mcid_info contains tag type for each MCID.
     """
-    import pikepdf
-
     instructions = list(pikepdf.parse_content_stream(page))
     new_instructions = []
     mcid = start_mcid
@@ -383,55 +572,88 @@ def inject_mcids_into_page(
 
 
 def make_accessible(
-    input_path: str,
-    output_path: str,
+    input_path: Path | str,
+    output_path: Path | str,
     analysis: Dict[str, Any],
     alt_texts: Optional[Dict[int, str]] = None,
+    preserve_structure: bool = False,
 ) -> str:
     """
     Add accessibility tags to PDF using pikepdf with proper MCID linking.
+    If preserve_structure is True, only fix metadata without touching existing tags.
     Returns the document title.
     """
-    import pikepdf
-
-    with pikepdf.open(input_path) as pdf:
-        # Set document language
-        pdf.Root.Lang = pikepdf.String("en-US")
+    with pikepdf.open(str(input_path)) as pdf:
+        # Set document language (only if not already set)
+        existing_lang = pdf.Root.get("/Lang")
+        if not existing_lang:
+            pdf.Root.Lang = pikepdf.String("en-US")
+            lang_to_use = "en-US"
+        else:
+            lang_to_use = str(existing_lang)
 
         # Set ViewerPreferences
         if "/ViewerPreferences" not in pdf.Root:
             pdf.Root.ViewerPreferences = pikepdf.Dictionary()
         pdf.Root.ViewerPreferences.DisplayDocTitle = True
 
-        # Set MarkInfo
-        pdf.Root.MarkInfo = pikepdf.Dictionary(
-            {
-                "/Marked": True,
-                "/Suspects": False,
-            }
-        )
+        # Set MarkInfo (only if not already set or if not preserving)
+        if not preserve_structure or not pdf.Root.get("/MarkInfo"):
+            pdf.Root.MarkInfo = pikepdf.Dictionary(
+                {
+                    "/Marked": True,
+                    "/Suspects": False,
+                }
+            )
 
-        # Find title from first H1
-        title = Path(input_path).stem
-        for page_data in analysis["pages"]:
-            for elem in page_data["elements"]:
-                if elem["type"] == "text":
-                    tag = classify_element(elem, analysis["heading_sizes"])
-                    if tag == "H1":
-                        title = elem["text"][:100]
-                        break
-            if title != Path(input_path).stem:
-                break
+        # Check for existing title
+        existing_title = None
+        if pdf.trailer.get("/Info"):
+            existing_title = pdf.trailer.Info.get("/Title")
+            if existing_title:
+                existing_title = str(existing_title).strip()
+                # Ignore placeholder titles
+                if existing_title.lower() in ("", "untitled", "(anonymous)"):
+                    existing_title = None
+
+        # Use existing title if valid, otherwise find from first H1
+        if existing_title:
+            title = existing_title
+        else:
+            title = Path(input_path).stem
+            for page_data in analysis["pages"]:
+                for elem in page_data["elements"]:
+                    if elem["type"] == "text":
+                        tag = classify_element(elem, analysis["heading_sizes"])
+                        if tag == "H1":
+                            title = elem["text"][:100]
+                            break
+                if title != Path(input_path).stem:
+                    break
 
         # Set title metadata
         with pdf.open_metadata() as meta:
             meta["dc:title"] = title
-            meta["dc:language"] = "en-US"
+            meta["dc:language"] = lang_to_use
 
         if pdf.trailer.get("/Info"):
             pdf.trailer.Info["/Title"] = pikepdf.String(title)
             pdf.trailer.Info["/Producer"] = pikepdf.String("PDF Accessibility Tool")
             pdf.trailer.Info["/Creator"] = pikepdf.String("PDF Accessibility Tool")
+        else:
+            # Create Info dict if it doesn't exist
+            pdf.trailer.Info = pikepdf.Dictionary(
+                {
+                    "/Title": pikepdf.String(title),
+                    "/Producer": pikepdf.String("PDF Accessibility Tool"),
+                    "/Creator": pikepdf.String("PDF Accessibility Tool"),
+                }
+            )
+
+        # If preserving structure, skip MCID injection and structure tree creation
+        if preserve_structure:
+            pdf.save(str(output_path))
+            return title
 
         # Process each page - inject MCIDs into content streams
         all_struct_elems = []
@@ -535,7 +757,7 @@ def make_accessible(
         doc_elem["/P"] = struct_tree_root
         pdf.Root.StructTreeRoot = struct_tree_root
 
-        pdf.save(output_path)
+        pdf.save(str(output_path))
 
         return title
 
@@ -548,27 +770,6 @@ def save_check_report(results: Dict[str, Any], report_path: Path, label: str) ->
         f.write(f"```\n{report}\n```\n")
 
 
-def is_already_accessible(results: Dict[str, Any]) -> bool:
-    """Check if a PDF is already well-tagged with MCIDs."""
-    # Check for key indicators of a well-tagged PDF
-    checks = results.get("checks", [])
-
-    has_mcids = False
-    has_parent_tree = False
-    has_struct_tree = False
-
-    for status, category, message in checks:
-        if "Content marked with MCIDs" in message and status == "pass":
-            has_mcids = True
-        if "Parent tree: Present" in message and status == "pass":
-            has_parent_tree = True
-        if "Structure tree: Present" in message and status == "pass":
-            has_struct_tree = True
-
-    # Consider it already accessible if it has MCIDs and ParentTree
-    return has_mcids and has_parent_tree and has_struct_tree
-
-
 def process_pdf(input_path: Path, force: bool = False) -> int:
     """Process a PDF file to make it accessible."""
     output_path = input_path.parent / f"{input_path.stem}_accessible.pdf"
@@ -577,32 +778,60 @@ def process_pdf(input_path: Path, force: bool = False) -> int:
     # Run pre-check
     print("Checking current accessibility status...")
     pre_results = gather_accessibility_info(input_path)
+    flags = pre_results.get("flags", {})
 
-    # Check if already accessible
-    if is_already_accessible(pre_results) and not force:
-        print()
-        print("This PDF is already well-tagged with MCIDs and structure.")
-        print(f"  - Passed: {pre_results['summary']['passed']}")
-        print(f"  - Warnings: {pre_results['summary']['warned']}")
-        print(f"  - Failed: {pre_results['summary']['failed']}")
-        print()
-        print("No processing needed. Use --force to override and reprocess.")
-        print(f"Run: uv run pdf_access.py --check {input_path}")
-        return 0
+    # Extract what's already good from pre-check
+    has_mcids = flags.get("mcids", False)
+    has_lang = flags.get("language", False)
+    has_title = flags.get("title", False)
+    has_display_title = flags.get("display_title", False)
 
-    print(f"  - Found {pre_results['summary']['failed']} issue(s) to fix")
+    # Check if PDF already has MCIDs - if so, only fix metadata, don't rebuild structure
+    preserve_structure = has_mcids and not force
+
+    # Report current status
+    if pre_results["summary"]["failed"] == 0 and pre_results["summary"]["warned"] == 0:
+        print("  ✓ PDF is already fully accessible!")
+    else:
+        if has_mcids:
+            print("  ✓ Has MCIDs (preserving existing structure)")
+        if has_lang:
+            print("  ✓ Has language set")
+        if has_title:
+            print("  ✓ Has title set")
+        print(f"  - Found {pre_results['summary']['failed']} issue(s) to fix")
     print()
 
     print("Analyzing document structure...")
-    analysis = analyze_document(str(input_path))
+    try:
+        analysis = analyze_document(str(input_path))
+    except Exception as e:
+        print(f"Error analyzing document: {e}")
+        return 1
 
     print("Applying accessibility fixes...")
-    print("  - Adding document tags")
-    print("  - Setting document language (en-US)")
+    if not preserve_structure:
+        print("  - Adding document tags with MCIDs")
+    if not has_lang:
+        print("  - Setting document language (en-US)")
 
-    title = make_accessible(str(input_path), str(output_path), analysis)
-    print(f"  - Setting document title: {title[:50]}{'...' if len(title) > 50 else ''}")
-    print("  - Enabling display document title")
+    try:
+        title = make_accessible(
+            str(input_path),
+            str(output_path),
+            analysis,
+            preserve_structure=preserve_structure,
+        )
+    except Exception as e:
+        print(f"Error making document accessible: {e}")
+        return 1
+
+    if not has_title:
+        print(
+            f"  - Setting document title: {title[:50]}{'...' if len(title) > 50 else ''}"
+        )
+    if not has_display_title:
+        print("  - Enabling display document title")
     print(f"Saving: {output_path}")
 
     # Handle images
@@ -679,9 +908,6 @@ def process_pdf(input_path: Path, force: bool = False) -> int:
 
 def gather_accessibility_info(pdf_path: Path) -> Dict[str, Any]:
     """Gather accessibility information from a PDF without printing."""
-    import pikepdf
-    import fitz
-
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     results: Dict[str, Any] = {
@@ -692,6 +918,7 @@ def gather_accessibility_info(pdf_path: Path) -> Dict[str, Any]:
         "checks": [],  # List of (status, category, message) tuples
         "tag_counts": {},
         "summary": {"passed": 0, "warned": 0, "failed": 0},
+        "flags": {},  # Initialize flags once here
     }
 
     def add_check(status: str, category: str, message: str):
@@ -700,8 +927,9 @@ def gather_accessibility_info(pdf_path: Path) -> Dict[str, Any]:
             results["summary"]["passed"] += 1
         elif status == "warn":
             results["summary"]["warned"] += 1
-        else:
+        elif status == "fail":
             results["summary"]["failed"] += 1
+        # "info" status doesn't affect pass/warn/fail counts
 
     # Open with both libraries
     try:
@@ -710,21 +938,31 @@ def gather_accessibility_info(pdf_path: Path) -> Dict[str, Any]:
         results["error"] = str(e)
         return results
 
-    doc = fitz.open(str(pdf_path))
+    try:
+        doc = fitz.open(str(pdf_path))
+    except Exception as e:
+        pdf.close()
+        results["error"] = str(e)
+        return results
+
     results["pages"] = len(doc)
 
     # === Document Settings ===
     mark_info = pdf.Root.get("/MarkInfo")
     if mark_info and mark_info.get("/Marked"):
         add_check("pass", "Document Settings", "Tagged PDF: Yes")
+        results["flags"]["tagged"] = True
     else:
         add_check("fail", "Document Settings", "Tagged PDF: No")
+        results["flags"]["tagged"] = False
 
     lang = pdf.Root.get("/Lang")
     if lang:
         add_check("pass", "Document Settings", f"Language: {lang}")
+        results["flags"]["language"] = True
     else:
         add_check("fail", "Document Settings", "Language: Not set")
+        results["flags"]["language"] = False
 
     title = None
     if pdf.trailer.get("/Info"):
@@ -734,56 +972,50 @@ def gather_accessibility_info(pdf_path: Path) -> Dict[str, Any]:
         if len(title_str) > 50:
             title_str = title_str[:50] + "..."
         add_check("pass", "Document Settings", f'Title: "{title_str}"')
+        results["flags"]["title"] = True
     else:
         add_check("fail", "Document Settings", "Title: Not set")
+        results["flags"]["title"] = False
 
     viewer_prefs = pdf.Root.get("/ViewerPreferences")
     if viewer_prefs and viewer_prefs.get("/DisplayDocTitle"):
         add_check("pass", "Document Settings", "Display Doc Title: Enabled")
+        results["flags"]["display_title"] = True
     else:
         add_check("fail", "Document Settings", "Display Doc Title: Disabled")
+        results["flags"]["display_title"] = False
+
+    # === Fonts ===
+    fonts_checked = 0
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        font_list = page.get_fonts()
+        for font in font_list:
+            fonts_checked += 1
+            # font[4] is the font type - if it contains "Type3" or encoding issues, might be problematic
+            # font[3] is the encoding
+            # For embedded fonts, we'd need deeper inspection, but basic check:
+            # If font name starts with a tag like ABCDEF+, it's usually subset embedded
+
+    if fonts_checked > 0:
+        add_check("info", "Fonts", f"Found {fonts_checked} font references")
 
     # === Structure ===
     tag_counts: Dict[str, int] = {}
-    figures_without_alt = 0
-    figures_with_placeholder = 0
     figures_with_alt = 0
+    figures_with_placeholder = 0
+    figures_without_alt = 0
 
     struct_tree = pdf.Root.get("/StructTreeRoot")
     if struct_tree:
         add_check("pass", "Document Structure", "Structure tree: Present")
 
-        def count_tags(elem):
-            nonlocal figures_without_alt, figures_with_placeholder, figures_with_alt
-            if not hasattr(elem, "get"):
-                return
-
-            tag = str(elem.get("/S", "")).replace("/", "")
-            if tag:
-                tag_counts[tag] = tag_counts.get(tag, 0) + 1
-
-                if tag == "Figure":
-                    alt = elem.get("/Alt")
-                    if alt:
-                        alt_str = str(alt)
-                        if "alt text needed" in alt_str.lower() or alt_str == "":
-                            figures_with_placeholder += 1
-                        else:
-                            figures_with_alt += 1
-                    else:
-                        figures_without_alt += 1
-
-            kids = elem.get("/K")
-            if kids:
-                if hasattr(kids, "__iter__") and not isinstance(kids, (str, bytes)):
-                    for kid in kids:
-                        count_tags(kid)
-                else:
-                    count_tags(kids)
-
-        doc_elem = struct_tree.get("/K")
-        if doc_elem:
-            count_tags(doc_elem)
+        # Count tags and analyze figures
+        struct_info = _count_structure_tags(struct_tree)
+        tag_counts = struct_info["tag_counts"]
+        figures_with_alt = struct_info["figures_with_alt"]
+        figures_with_placeholder = struct_info["figures_with_placeholder"]
+        figures_without_alt = struct_info["figures_without_alt"]
 
         results["tag_counts"] = tag_counts
         total_tags = sum(tag_counts.values())
@@ -798,6 +1030,23 @@ def gather_accessibility_info(pdf_path: Path) -> Dict[str, Any]:
                 "Document Structure",
                 "Parent tree: Missing (navigation may be limited)",
             )
+
+        # Check heading order (H1 should come before H2, etc.)
+        h1_count = tag_counts.get("H1", 0)
+        h2_count = tag_counts.get("H2", 0)
+        h3_count = tag_counts.get("H3", 0)
+
+        if h2_count > 0 and h1_count == 0:
+            add_check(
+                "warn", "Document Structure", "H2 found without H1 (heading hierarchy)"
+            )
+        if h3_count > 0 and h2_count == 0 and h1_count == 0:
+            add_check(
+                "warn",
+                "Document Structure",
+                "H3 found without H1/H2 (heading hierarchy)",
+            )
+
     else:
         add_check("fail", "Document Structure", "Structure tree: Missing")
 
@@ -856,66 +1105,8 @@ def gather_accessibility_info(pdf_path: Path) -> Dict[str, Any]:
             )
 
     # === Advanced PDF/UA Checks ===
-    has_mcids = False
-
-    def is_mcid_value(val):
-        """Check if value is an MCID (integer or pikepdf integer)."""
-        try:
-            int(val)
-            return not hasattr(val, "get")  # Not a dict
-        except (TypeError, ValueError):
-            return False
-
-    def is_array(val):
-        """Check if value is a pikepdf Array (iterable but not dict/str)."""
-        if isinstance(val, (str, bytes)):
-            return False
-        if not hasattr(val, "__iter__"):
-            return False
-        # pikepdf dicts have .get(), arrays don't (they have .append())
-        return hasattr(val, "append") or not hasattr(val, "get")
-
-    def check_mcids(elem):
-        nonlocal has_mcids
-        if has_mcids:
-            return
-        if not hasattr(elem, "get"):
-            return
-
-        kids = elem.get("/K")
-        if kids is None:
-            return
-
-        # /K can be: integer (MCID), dict with /MCID, or array of these
-        # Check if /K is an integer (direct MCID reference)
-        if is_mcid_value(kids):
-            has_mcids = True
-            return
-
-        # /K is an array
-        if is_array(kids):
-            for kid in kids:
-                if is_mcid_value(kid):
-                    has_mcids = True
-                    return
-                if hasattr(kid, "get"):
-                    if kid.get("/MCID") is not None or kid.get("/Type") == "/MCR":
-                        has_mcids = True
-                        return
-                    check_mcids(kid)
-            return
-
-        # /K is a dictionary with /MCID or a struct elem
-        if hasattr(kids, "get"):
-            if kids.get("/MCID") is not None or kids.get("/Type") == "/MCR":
-                has_mcids = True
-                return
-            check_mcids(kids)
-
-    if struct_tree:
-        doc_elem = struct_tree.get("/K")
-        if doc_elem:
-            check_mcids(doc_elem)
+    has_mcids = struct_tree and _check_for_mcids(struct_tree)
+    results["flags"]["mcids"] = bool(has_mcids)
 
     if has_mcids:
         add_check("pass", "Advanced (PDF/UA)", "Content marked with MCIDs")
@@ -926,7 +1117,7 @@ def gather_accessibility_info(pdf_path: Path) -> Dict[str, Any]:
 
     if mark_info:
         suspects = mark_info.get("/Suspects")
-        if suspects == False or suspects is None:
+        if not suspects:
             add_check("pass", "Advanced (PDF/UA)", "Suspects flag: Clear")
         else:
             add_check(
@@ -942,70 +1133,61 @@ def gather_accessibility_info(pdf_path: Path) -> Dict[str, Any]:
 
 
 def format_accessibility_report(
-    results: Dict[str, Any], include_header: bool = True
+    results: Dict[str, Any], use_symbols: bool = False
 ) -> str:
-    """Format accessibility results as a string report."""
-    lines = []
+    """
+    Format accessibility results as a string report.
 
+    Args:
+        results: Accessibility check results from gather_accessibility_info()
+        use_symbols: If True, use Unicode symbols (✓/⚠/✗). If False, use [PASS]/[WARN]/[FAIL].
+    """
     if "error" in results:
-        return f"Error opening PDF: {results['error']}"
+        prefix = "✗ " if use_symbols else ""
+        return f"{prefix}Error opening PDF: {results['error']}"
 
-    if include_header:
-        lines.append(f"Document: {results['filename']}")
-        lines.append(f"Checked: {results['timestamp']}")
-        lines.append(f"Pages: {results['pages']}")
-        lines.append("")
+    # Status prefixes
+    if use_symbols:
+        prefixes = {"pass": "✓", "warn": "⚠", "fail": "✗", "info": ""}
+    else:
+        prefixes = {"pass": "[PASS]", "warn": "[WARN]", "fail": "[FAIL]", "info": ""}
+
+    lines = [
+        f"Document: {results['filename']}",
+        f"Checked: {results['timestamp']}",
+        f"Pages: {results['pages']}",
+        "",
+    ]
 
     # Group checks by category
-    categories: Dict[str, List] = {}
+    checks_by_category: Dict[str, List] = {}
     for status, category, message in results["checks"]:
-        if category not in categories:
-            categories[category] = []
-        categories[category].append((status, message))
+        if category not in checks_by_category:
+            checks_by_category[category] = []
+        checks_by_category[category].append((status, message))
 
-    # Output each category
-    for category in [
-        "Document Settings",
-        "Document Structure",
-        "Images & Alt Text",
-        "Advanced (PDF/UA)",
-    ]:
-        if category not in categories:
+    # Output each category in order
+    for category in CATEGORIES:
+        if category not in checks_by_category:
             continue
 
         lines.append(f"{category}:")
-        for status, message in categories[category]:
-            if status == "pass":
-                lines.append(f"  [PASS] {message}")
-            elif status == "warn":
-                lines.append(f"  [WARN] {message}")
-            elif status == "fail":
-                lines.append(f"  [FAIL] {message}")
-            else:  # info
+        for status, message in checks_by_category[category]:
+            prefix = prefixes.get(status, "")
+            if prefix:
+                lines.append(f"  {prefix} {message}")
+            else:
                 lines.append(f"  {message}")
 
         # Show tag breakdown after structure section
         if category == "Document Structure" and results.get("tag_counts"):
             lines.append("    Tags found:")
-            for tag in [
-                "Document",
-                "H1",
-                "H2",
-                "H3",
-                "P",
-                "Figure",
-                "Table",
-                "L",
-                "LI",
-            ]:
-                if tag in results["tag_counts"]:
-                    lines.append(f"      - {tag}: {results['tag_counts'][tag]}")
-            other_tags = {
-                k: v
-                for k, v in results["tag_counts"].items()
-                if k
-                not in ["Document", "H1", "H2", "H3", "P", "Figure", "Table", "L", "LI"]
-            }
+            tag_counts = results["tag_counts"]
+            # Show known tags first, then others
+            for tag in KNOWN_TAGS:
+                if tag in tag_counts:
+                    lines.append(f"      - {tag}: {tag_counts[tag]}")
+            other_tags = {k: v for k, v in tag_counts.items() if k not in KNOWN_TAGS}
             for tag, count in sorted(other_tags.items()):
                 lines.append(f"      - {tag}: {count}")
 
@@ -1015,9 +1197,14 @@ def format_accessibility_report(
     summary = results["summary"]
     lines.append("=" * 50)
     lines.append("Summary:")
-    lines.append(f"  Passed:   {summary['passed']}")
-    lines.append(f"  Warnings: {summary['warned']}")
-    lines.append(f"  Failed:   {summary['failed']}")
+    if use_symbols:
+        lines.append(f"  ✓ Passed:   {summary['passed']}")
+        lines.append(f"  ⚠ Warnings: {summary['warned']}")
+        lines.append(f"  ✗ Failed:   {summary['failed']}")
+    else:
+        lines.append(f"  Passed:   {summary['passed']}")
+        lines.append(f"  Warnings: {summary['warned']}")
+        lines.append(f"  Failed:   {summary['failed']}")
     lines.append("")
 
     if summary["failed"] == 0 and summary["warned"] == 0:
@@ -1033,86 +1220,7 @@ def format_accessibility_report(
 
 def print_accessibility_report(results: Dict[str, Any]) -> None:
     """Print accessibility results with colored symbols to terminal."""
-    if "error" in results:
-        print(f"\n✗ Error opening PDF: {results['error']}")
-        return
-
-    print(f"Document: {results['filename']}")
-    print(f"Checked: {results['timestamp']}")
-    print(f"Pages: {results['pages']}")
-    print()
-
-    # Group checks by category
-    categories: Dict[str, List] = {}
-    for status, category, message in results["checks"]:
-        if category not in categories:
-            categories[category] = []
-        categories[category].append((status, message))
-
-    # Output each category
-    for category in [
-        "Document Settings",
-        "Document Structure",
-        "Images & Alt Text",
-        "Advanced (PDF/UA)",
-    ]:
-        if category not in categories:
-            continue
-
-        print(f"{category}:")
-        for status, message in categories[category]:
-            if status == "pass":
-                print(f"  ✓ {message}")
-            elif status == "warn":
-                print(f"  ⚠ {message}")
-            elif status == "fail":
-                print(f"  ✗ {message}")
-            else:  # info
-                print(f"  {message}")
-
-        # Show tag breakdown after structure section
-        if category == "Document Structure" and results.get("tag_counts"):
-            print("    Tags found:")
-            for tag in [
-                "Document",
-                "H1",
-                "H2",
-                "H3",
-                "P",
-                "Figure",
-                "Table",
-                "L",
-                "LI",
-            ]:
-                if tag in results["tag_counts"]:
-                    print(f"      - {tag}: {results['tag_counts'][tag]}")
-            other_tags = {
-                k: v
-                for k, v in results["tag_counts"].items()
-                if k
-                not in ["Document", "H1", "H2", "H3", "P", "Figure", "Table", "L", "LI"]
-            }
-            for tag, count in sorted(other_tags.items()):
-                print(f"      - {tag}: {count}")
-
-        print()
-
-    # Summary
-    summary = results["summary"]
-    print("=" * 50)
-    print("Summary:")
-    print(f"  ✓ Passed:   {summary['passed']}")
-    print(f"  ⚠ Warnings: {summary['warned']}")
-    print(f"  ✗ Failed:   {summary['failed']}")
-    print()
-
-    if summary["failed"] == 0 and summary["warned"] == 0:
-        print("This PDF should pass Adobe Acrobat's accessibility checker.")
-    elif summary["failed"] == 0:
-        print("This PDF may pass basic checks but has some warnings.")
-        print("Run Adobe Acrobat's full checker for complete validation.")
-    else:
-        print("This PDF will likely fail Adobe Acrobat's accessibility checker.")
+    print(format_accessibility_report(results, use_symbols=True))
 
 
 def check_accessibility(pdf_path: Path) -> int:
