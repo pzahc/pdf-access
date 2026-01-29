@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.ruff_cache/
+
+# Test outputs (generated files)
+*_accessible.pdf
+*_review/
+
+# Research notes (not for public repo)
+research*/
