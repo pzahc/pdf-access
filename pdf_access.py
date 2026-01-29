@@ -722,6 +722,11 @@ def make_accessible(
                 parent_tree_nums.append(page_num)
                 parent_tree_nums.append(pikepdf.Array(page_struct_elems))
 
+            # Set tab order to follow structure (required for PDF/UA)
+            page.Tabs = pikepdf.Name("/S")
+            # Link page to its ParentTree entry
+            page.StructParents = page_num
+
         # Create Document element
         doc_elem = pdf.make_indirect(
             pikepdf.Dictionary(
@@ -1125,6 +1130,26 @@ def gather_accessibility_info(pdf_path: Path) -> Dict[str, Any]:
                 "Advanced (PDF/UA)",
                 "Suspects flag: Set (structure may need review)",
             )
+
+    # Check tab order on pages
+    pages_with_tab_order = 0
+    for page in pdf.pages:
+        if page.get("/Tabs") == pikepdf.Name("/S"):
+            pages_with_tab_order += 1
+
+    if pages_with_tab_order == len(pdf.pages):
+        add_check("pass", "Advanced (PDF/UA)", "Tab order: Follows structure")
+        results["flags"]["tab_order"] = True
+    elif pages_with_tab_order > 0:
+        add_check(
+            "warn",
+            "Advanced (PDF/UA)",
+            f"Tab order: Only {pages_with_tab_order}/{len(pdf.pages)} pages set",
+        )
+        results["flags"]["tab_order"] = False
+    else:
+        add_check("fail", "Advanced (PDF/UA)", "Tab order: Not set")
+        results["flags"]["tab_order"] = False
 
     doc.close()
     pdf.close()
