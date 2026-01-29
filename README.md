@@ -24,10 +24,11 @@ uv run pdf_access.py alt_text.md          # Apply alt text edits
 
 | Issue | Fix |
 |-------|-----|
-| Missing document tags | Auto-tags headings (H1-H3), paragraphs, figures |
+| Missing document tags | Auto-tags headings (H1-H3), paragraphs, figures with MCIDs |
 | No document language | Sets `en-US` |
 | Missing/hidden title | Extracts from first heading, enables display |
 | Images without alt text | Markdown file for easy editing + auto-detects captions |
+| No structure tree | Creates full structure tree with ParentTree |
 
 ## Workflow
 
@@ -80,9 +81,9 @@ Summary:
 
 ## Limitations
 
-- **No MCID linking** - Tags aren't linked to content streams. For full PDF/UA compliance, run Adobe Acrobat Pro's "Make Accessible" after this tool.
 - **Font-based heading detection** - Works best with consistent styles.
 - **Basic table support** - Complex tables may need manual review.
+- **Simple reading order** - Uses document flow order; complex layouts may need review.
 
 ## Dependencies
 

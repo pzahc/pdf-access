@@ -310,6 +310,78 @@ def apply_alt_text_to_pdf(pdf_path: str, alt_texts: Dict[int, str]) -> None:
         pdf.save(pdf_path)
 
 
+def inject_mcids_into_page(
+    pdf,
+    page,
+    analysis_elements: List[Dict],
+    heading_sizes: List[float],
+    start_mcid: int = 0,
+) -> tuple:
+    """
+    Inject BDC/EMC markers into a page's content stream.
+    Returns (mcid_info_list, next_mcid) where mcid_info contains tag type for each MCID.
+    """
+    import pikepdf
+
+    instructions = list(pikepdf.parse_content_stream(page))
+    new_instructions = []
+    mcid = start_mcid
+    mcid_info = []
+
+    # Track which analysis element we're on (text blocks map to analysis)
+    text_block_index = 0
+    text_elements = [e for e in analysis_elements if e["type"] == "text"]
+    image_index = 0
+    image_elements = [e for e in analysis_elements if e["type"] == "image"]
+
+    for operands, operator in instructions:
+        op = str(operator)
+
+        if op == "BT":
+            # Determine tag type from analysis
+            if text_block_index < len(text_elements):
+                elem = text_elements[text_block_index]
+                tag = classify_element(elem, heading_sizes)
+                text_block_index += 1
+            else:
+                tag = "P"
+
+            bdc_operands = [
+                pikepdf.Name(f"/{tag}"),
+                pikepdf.Dictionary({"/MCID": mcid}),
+            ]
+            new_instructions.append((bdc_operands, pikepdf.Operator("BDC")))
+            mcid_info.append({"type": "text", "tag": tag, "mcid": mcid})
+
+        elif op == "Do":
+            # Image/XObject
+            if image_index < len(image_elements):
+                image_index += 1
+
+            bdc_operands = [
+                pikepdf.Name("/Figure"),
+                pikepdf.Dictionary({"/MCID": mcid}),
+            ]
+            new_instructions.append((bdc_operands, pikepdf.Operator("BDC")))
+            mcid_info.append({"type": "image", "tag": "Figure", "mcid": mcid})
+            new_instructions.append((operands, operator))
+            new_instructions.append(([], pikepdf.Operator("EMC")))
+            mcid += 1
+            continue
+
+        new_instructions.append((operands, operator))
+
+        if op == "ET":
+            new_instructions.append(([], pikepdf.Operator("EMC")))
+            mcid += 1
+
+    # Write new content stream
+    new_content = pikepdf.unparse_content_stream(new_instructions)
+    page.Contents = pdf.make_stream(new_content)
+
+    return mcid_info, mcid
+
+
 def make_accessible(
     input_path: str,
     output_path: str,
@@ -317,7 +389,7 @@ def make_accessible(
     alt_texts: Optional[Dict[int, str]] = None,
 ) -> str:
     """
-    Add accessibility tags to PDF using pikepdf.
+    Add accessibility tags to PDF using pikepdf with proper MCID linking.
     Returns the document title.
     """
     import pikepdf
@@ -361,50 +433,108 @@ def make_accessible(
             pdf.trailer.Info["/Producer"] = pikepdf.String("PDF Accessibility Tool")
             pdf.trailer.Info["/Creator"] = pikepdf.String("PDF Accessibility Tool")
 
-        # Build structure tree
-        doc_elem = pikepdf.Dictionary(
-            {
-                "/S": pikepdf.Name("/Document"),
-                "/K": pikepdf.Array([]),
-            }
-        )
-
+        # Process each page - inject MCIDs into content streams
+        all_struct_elems = []
+        parent_tree_nums = []
         figure_count = 0
-        for page_data in analysis["pages"]:
-            elements = page_data["elements"]
-            for i, elem in enumerate(elements):
-                tag = classify_element(elem, analysis["heading_sizes"])
 
-                struct_elem = pikepdf.Dictionary(
-                    {
-                        "/S": pikepdf.Name(f"/{tag}"),
-                    }
+        for page_num, page in enumerate(pdf.pages):
+            page_analysis = (
+                analysis["pages"][page_num]
+                if page_num < len(analysis["pages"])
+                else {"elements": []}
+            )
+
+            # Inject MCIDs into this page's content stream
+            mcid_info, _ = inject_mcids_into_page(
+                pdf,
+                page,
+                page_analysis["elements"],
+                analysis["heading_sizes"],
+                start_mcid=0,  # MCIDs reset per page
+            )
+
+            # Create structure elements for this page
+            page_struct_elems = []
+            for info in mcid_info:
+                tag = info["tag"]
+                mcid = info["mcid"]
+
+                struct_elem = pdf.make_indirect(
+                    pikepdf.Dictionary(
+                        {
+                            "/Type": pikepdf.Name("/StructElem"),
+                            "/S": pikepdf.Name(f"/{tag}"),
+                            "/Pg": page.obj,
+                            "/K": mcid,
+                        }
+                    )
                 )
 
+                # Add alt text for figures
                 if tag == "Figure":
                     figure_count += 1
-                    # Use provided alt text, or auto-detected caption, or placeholder
                     if alt_texts and figure_count in alt_texts:
                         struct_elem["/Alt"] = pikepdf.String(alt_texts[figure_count])
                     else:
-                        caption = find_image_caption(elements, i)
-                        if caption:
-                            struct_elem["/Alt"] = pikepdf.String(caption)
-                        else:
-                            struct_elem["/Alt"] = pikepdf.String(
-                                f"Image {figure_count} - alt text needed"
-                            )
+                        # Try to find caption from analysis
+                        elements = page_analysis["elements"]
+                        img_indices = [
+                            i for i, e in enumerate(elements) if e["type"] == "image"
+                        ]
+                        img_idx = figure_count - 1
+                        if img_idx < len(img_indices):
+                            caption = find_image_caption(elements, img_indices[img_idx])
+                            if caption:
+                                struct_elem["/Alt"] = pikepdf.String(caption)
+                            else:
+                                struct_elem["/Alt"] = pikepdf.String(
+                                    f"Image {figure_count} - alt text needed"
+                                )
 
-                doc_elem["/K"].append(struct_elem)
+                page_struct_elems.append(struct_elem)
+                all_struct_elems.append(struct_elem)
 
-        struct_tree = pikepdf.Dictionary(
-            {
-                "/Type": pikepdf.Name("/StructTreeRoot"),
-                "/K": doc_elem,
-            }
+            # Add to ParentTree: page_num -> array of struct elems by MCID order
+            if page_struct_elems:
+                parent_tree_nums.append(page_num)
+                parent_tree_nums.append(pikepdf.Array(page_struct_elems))
+
+        # Create Document element
+        doc_elem = pdf.make_indirect(
+            pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructElem"),
+                    "/S": pikepdf.Name("/Document"),
+                    "/K": pikepdf.Array(all_struct_elems),
+                }
+            )
         )
 
-        pdf.Root.StructTreeRoot = struct_tree
+        # Set parent references for all struct elems
+        for elem in all_struct_elems:
+            elem["/P"] = doc_elem
+
+        # Create ParentTree
+        parent_tree = pdf.make_indirect(
+            pikepdf.Dictionary({"/Nums": pikepdf.Array(parent_tree_nums)})
+        )
+
+        # Create StructTreeRoot
+        struct_tree_root = pdf.make_indirect(
+            pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructTreeRoot"),
+                    "/K": doc_elem,
+                    "/ParentTree": parent_tree,
+                    "/ParentTreeNextKey": len(pdf.pages),
+                }
+            )
+        )
+
+        doc_elem["/P"] = struct_tree_root
+        pdf.Root.StructTreeRoot = struct_tree_root
+
         pdf.save(output_path)
 
         return title
