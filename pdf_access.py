@@ -1388,7 +1388,8 @@ def parse_alt_text_markdown(md_path: Path | str) -> Dict[str, Any]:
 
     # Find all alt text entries
     # Pattern: ## Image N ... Alt text: <text>
-    pattern = r"## Image (\d+).*?Alt text:\s*(.+?)(?=\n---|\n## Image|\Z)"
+    # Also support ## Figure N (created by structure analysis)
+    pattern = r"## (?:Figure|Image) (\d+).*?Alt text:\s*(.+?)(?=\n---|\n## (?:Figure|Image)|\Z)"
     matches = re.findall(pattern, content, re.DOTALL)
 
     alt_texts = {}
@@ -1801,15 +1802,23 @@ def inject_mcids_into_page(
             if image_index < len(image_elements):
                 image_index += 1
 
-            bdc_operands = [
-                pikepdf.Name("/Figure"),
-                pikepdf.Dictionary({"/MCID": mcid}),
-            ]
-            new_instructions.append((bdc_operands, pikepdf.Operator("BDC")))
-            mcid_info.append({"type": "image", "tag": "Figure", "mcid": mcid})
-            new_instructions.append((operands, operator))
-            new_instructions.append(([], pikepdf.Operator("EMC")))
-            mcid += 1
+                bdc_operands = [
+                    pikepdf.Name("/Figure"),
+                    pikepdf.Dictionary({"/MCID": mcid}),
+                ]
+                new_instructions.append((bdc_operands, pikepdf.Operator("BDC")))
+                mcid_info.append({"type": "image", "tag": "Figure", "mcid": mcid})
+                new_instructions.append((operands, operator))
+                new_instructions.append(([], pikepdf.Operator("EMC")))
+                mcid += 1
+            else:
+                # Extra XObject not in analysis (likely decorative or nested) - tag as Artifact
+                new_instructions.append(
+                    ([pikepdf.Name("/Artifact")], pikepdf.Operator("BMC"))
+                )
+                new_instructions.append((operands, operator))
+                new_instructions.append(([], pikepdf.Operator("EMC")))
+
             continue
 
         elif op in path_construction_operators:
@@ -1948,6 +1957,56 @@ def remediate_pdf(
     has_bookmarks = bookmark_info.get("has_bookmarks", False)
 
     with pikepdf.open(str(input_path)) as pdf:
+        # Validate existing structure if we are asked to preserve it
+        if preserve_structure and pdf.Root.get("/StructTreeRoot"):
+            # Check for broken Link structure (common in Pages/Word exports)
+            # Links must have an OBJR (Object Reference) child to be valid PDF/UA
+            link_tags = 0
+            objr_nodes = 0
+
+            def check_link_structure(elem):
+                nonlocal link_tags, objr_nodes
+                if not hasattr(elem, "get"):
+                    return
+
+                tag = str(elem.get("/S", ""))
+                if tag == "/Link":
+                    link_tags += 1
+
+                k = elem.get("/K")
+                if k:
+                    if isinstance(k, pikepdf.Dictionary):
+                        if k.get("/Type") == "/OBJR":
+                            objr_nodes += 1
+                        elif k.get("/S"):
+                            check_link_structure(k)
+                    elif is_pdf_array(k):
+                        for item in k:
+                            if isinstance(item, pikepdf.Dictionary):
+                                if item.get("/Type") == "/OBJR":
+                                    objr_nodes += 1
+                                elif item.get("/S"):
+                                    check_link_structure(item)
+
+            struct_root = pdf.Root.StructTreeRoot
+            if struct_root.get("/K"):
+                k_root = struct_root.get("/K")
+                if is_pdf_array(k_root):
+                    for item in k_root:
+                        check_link_structure(item)
+                else:
+                    check_link_structure(k_root)
+
+            # Heuristic: If we have Links but no OBJRs, the structure is broken
+            if link_tags > 0 and objr_nodes == 0:
+                print(
+                    f"  ⚠ Detected {link_tags} Link tags but 0 annotation references (OBJR)."
+                )
+                print(
+                    "  Existing structure is broken. Switching to FORCE REBUILD mode."
+                )
+                preserve_structure = False
+
         # Set document language (only if diagnostic says it's missing)
         if not has_lang:
             pdf.Root.Lang = pikepdf.String("en-US")
@@ -2026,16 +2085,22 @@ def remediate_pdf(
             for idx, page in enumerate(pdf.pages):
                 page_objgen_to_idx[page.obj.objgen] = idx
 
-            # Collect MCIDs per page from existing structure
-            # Format: page_idx -> list of (mcid, struct_elem) in MCID order
+            # Collect MCIDs and OBJR (Annotations) per page/key from existing structure
+            # Format: key (int) -> object (struct_elem or array of them)
+            parent_tree_mapping: Dict[int, Any] = {}
+
+            # Also track which struct elem belongs to which page for MCIDs
             page_mcids: Dict[int, List[tuple]] = {i: [] for i in range(len(pdf.pages))}
 
-            def collect_mcids_from_struct(elem, parent_page_idx=None):
-                """Recursively collect MCIDs from structure elements."""
+            # Track Annotation StructParents to rebuild
+            annot_struct_parents: Dict[int, Any] = {}  # old_key -> struct_elem
+
+            def collect_structure_info(elem, parent_page_idx=None):
+                """Recursively collect MCIDs and OBJRs from structure elements."""
                 if not hasattr(elem, "get"):
                     return
 
-                # Get page reference from this element or inherit from parent
+                # Get page reference
                 pg = elem.get("/Pg")
                 if pg is not None:
                     page_idx = page_objgen_to_idx.get(pg.objgen, parent_page_idx)
@@ -2044,51 +2109,138 @@ def remediate_pdf(
 
                 k = elem.get("/K")
                 if k is not None:
-                    # K can be: int (MCID), dict, or array
-                    if is_mcid_value(k):
-                        if page_idx is not None:
-                            page_mcids[page_idx].append((int(k), elem))
-                    elif is_pdf_array(k):
-                        for item in k:
-                            if is_mcid_value(item):
-                                if page_idx is not None:
-                                    page_mcids[page_idx].append((int(item), elem))
-                            elif hasattr(item, "get"):
-                                mcid = item.get("/MCID")
-                                if mcid is not None:
-                                    if page_idx is not None:
-                                        page_mcids[page_idx].append((int(mcid), elem))
-                                elif item.get("/S"):  # Child struct elem
-                                    collect_mcids_from_struct(item, page_idx)
-                    elif hasattr(k, "get"):
-                        mcid = k.get("/MCID")
-                        if mcid is not None:
+                    # Helper to process a single KID item
+                    def process_kid(item):
+                        if is_mcid_value(item):
+                            # It's an MCID
                             if page_idx is not None:
-                                page_mcids[page_idx].append((int(mcid), elem))
-                        elif k.get("/S"):  # Child struct elem
-                            collect_mcids_from_struct(k, page_idx)
+                                page_mcids[page_idx].append((int(item), elem))
+                        elif isinstance(item, pikepdf.Dictionary):
+                            type_val = item.get("/Type")
+                            if type_val == "/OBJR":
+                                # It's an Object Reference (Annotation)
+                                obj = item.get("/Obj")
+                                if obj:
+                                    # We found an OBJR. The parent 'elem' is the Link structure element.
+                                    # We don't know the StructParent key yet, but we know 'elem' needs to be in ParentTree.
+                                    # We will assign new keys later.
+                                    # For now, store it in a list to process after walking.
+                                    # Use the object ID of the annotation as a unique identifier if possible
+                                    pass
+                            elif item.get("/S") or item.get("/K"):
+                                # Child structure element
+                                collect_structure_info(item, page_idx)
+                        elif hasattr(item, "get") and (
+                            item.get("/S") or item.get("/K")
+                        ):
+                            # Child structure element (generic)
+                            collect_structure_info(item, page_idx)
 
-            # Walk structure tree to collect MCIDs
+                    if is_pdf_array(k):
+                        for child in k:
+                            process_kid(child)
+                    else:
+                        process_kid(k)
+
+            # Walk structure tree
             if struct_tree:
                 doc_elem = struct_tree.get("/K")
                 if doc_elem:
                     if is_pdf_array(doc_elem):
                         for child in doc_elem:
-                            collect_mcids_from_struct(child)
+                            collect_structure_info(child)
                     else:
-                        collect_mcids_from_struct(doc_elem)
+                        collect_structure_info(doc_elem)
 
-            # Build ParentTree from collected MCIDs
+            # --- Rebuild ParentTree completely ---
             parent_tree_nums = []
+
+            # 1. Page Content (MCIDs) - Keys 0 to N-1
             for page_idx in range(len(pdf.pages)):
                 mcid_list = page_mcids[page_idx]
                 if mcid_list:
-                    # Sort by MCID to ensure correct order
                     mcid_list.sort(key=lambda x: x[0])
-                    # Create array of struct elements in MCID order
                     struct_elem_array = pikepdf.Array([elem for _, elem in mcid_list])
                     parent_tree_nums.append(page_idx)
                     parent_tree_nums.append(struct_elem_array)
+
+            # 2. Annotations (Links, etc.) - Keys N and up
+            # We need to find all annotations in the PDF, check if they have a StructParent,
+            # and if so, map that StructParent to the corresponding Structure Element.
+            # BUT, the mapping in the PDF is currently broken/duplicate.
+            # So we should:
+            #   a. Find all annotations.
+            #   b. If an annotation is a Link, try to find its corresponding StructElem in the tree (via OBJR).
+            #      (This requires the reverse map we missed in the walk above).
+
+            # Let's re-walk to build a map of {annot_obj_id: struct_elem}
+            annot_to_struct_elem = {}
+
+            def map_objr_to_elem(elem):
+                if not hasattr(elem, "get"):
+                    return
+                k = elem.get("/K")
+                if k:
+                    if isinstance(k, pikepdf.Dictionary) and k.get("/Type") == "/OBJR":
+                        obj = k.get("/Obj")
+                        if obj:
+                            annot_to_struct_elem[obj.objgen] = elem
+                    elif is_pdf_array(k):
+                        for item in k:
+                            if (
+                                isinstance(item, pikepdf.Dictionary)
+                                and item.get("/Type") == "/OBJR"
+                            ):
+                                obj = item.get("/Obj")
+                                if obj:
+                                    annot_to_struct_elem[obj.objgen] = elem
+
+                    # Recurse
+                    if isinstance(k, pikepdf.Dictionary) and k.get("/S"):
+                        map_objr_to_elem(k)
+                    elif is_pdf_array(k):
+                        for item in k:
+                            if isinstance(item, pikepdf.Dictionary) and item.get("/S"):
+                                map_objr_to_elem(item)
+
+            if struct_tree:
+                doc_elem = struct_tree.get("/K")
+                if doc_elem:
+                    if is_pdf_array(doc_elem):
+                        for child in doc_elem:
+                            map_objr_to_elem(child)
+                    else:
+                        map_objr_to_elem(doc_elem)
+
+            # Now iterate all pages and annotations, assigning NEW unique keys
+            next_key = len(pdf.pages)
+
+            for page in pdf.pages:
+                if "/Annots" in page:
+                    for annot in page.Annots:
+                        # If this is a Link or has a StructParent, we need to fix it
+                        subtype = annot.get("/Subtype")
+                        if subtype == "/Link" or "/StructParent" in annot:
+                            # Assign new unique key
+                            new_key = next_key
+                            next_key += 1
+                            annot["/StructParent"] = new_key
+
+                            # Find the structure element for this annotation
+                            struct_elem = annot_to_struct_elem.get(annot.objgen)
+
+                            if struct_elem:
+                                # Add to ParentTree
+                                parent_tree_nums.append(new_key)
+                                parent_tree_nums.append(struct_elem)
+                            else:
+                                # Warning: Annotation has no structure element!
+                                # Use a placeholder or skip?
+                                # If we skip adding to ParentTree, the validator will complain about missing entry.
+                                # But if we don't have a struct element, we can't add it.
+                                # Ideally, we should create one, but in 'preserve' mode we might just leave it orphan
+                                # or map it to a dummy.
+                                pass
 
             # Add or update ParentTree
             if struct_tree and parent_tree_nums:
@@ -2096,7 +2248,7 @@ def remediate_pdf(
                     pikepdf.Dictionary({"/Nums": pikepdf.Array(parent_tree_nums)})
                 )
                 struct_tree["/ParentTree"] = parent_tree
-                struct_tree["/ParentTreeNextKey"] = len(pdf.pages)
+                struct_tree["/ParentTreeNextKey"] = next_key
 
             # Add empty RoleMap if missing - we use standard tags only
             # Standard PDF 1.7 tags don't need role mapping
@@ -2129,6 +2281,7 @@ def remediate_pdf(
         # Process each page - inject MCIDs into content streams
         all_struct_elems = []
         parent_tree_nums = []
+        next_struct_parent_key = len(pdf.pages)  # Start after page indices
         figure_count = 0
 
         for page_num, page in enumerate(pdf.pages):
@@ -2477,7 +2630,8 @@ def remediate_pdf(
                 for annot_idx, annot in enumerate(annots):
                     # Calculate unique StructParent index for this annotation
                     # Pages use indices 0 to len(pages)-1, annotations start after
-                    annot_struct_parent = len(pdf.pages) + len(all_struct_elems)
+                    annot_struct_parent = next_struct_parent_key
+                    next_struct_parent_key += 1
 
                     # Create a Link structure element for this annotation
                     annot_subtype = str(annot.get("/Subtype", ""))
