@@ -961,6 +961,9 @@ def analyze_document(pdf_path: Path | str) -> Dict[str, Any]:
 
         blocks = page.get_text("dict")["blocks"]
 
+        # Track detected image bboxes to avoid duplicates
+        detected_image_bboxes = []
+
         for block in blocks:
             if block["type"] == 0:  # text block
                 for line in block.get("lines", []):
@@ -1012,6 +1015,7 @@ def analyze_document(pdf_path: Path | str) -> Dict[str, Any]:
                             )
             elif block["type"] == 1:  # image
                 bbox = block["bbox"]
+                detected_image_bboxes.append(bbox)
                 if not is_in_table(bbox):
                     page_data["elements"].append(
                         {
@@ -1019,6 +1023,7 @@ def analyze_document(pdf_path: Path | str) -> Dict[str, Any]:
                             "bbox": bbox,
                             "width": block["width"],
                             "height": block["height"],
+                            "source": "layout",
                         }
                     )
                     analysis["images"].append(
@@ -1028,6 +1033,76 @@ def analyze_document(pdf_path: Path | str) -> Dict[str, Any]:
                             "height": block["height"],
                         }
                     )
+
+        # 1. XObject Images
+        raw_images = page.get_images(full=True)
+        for img_info in raw_images:
+            xref = img_info[0]
+            rects = page.get_image_rects(xref)
+            for rect in rects:
+                bbox = tuple(rect)
+                already_found = False
+                for existing_bbox in detected_image_bboxes:
+                    if boxes_overlap(bbox, existing_bbox, tolerance=1.0):
+                        already_found = True
+                        break
+
+                if not already_found:
+                    width = bbox[2] - bbox[0]
+                    height = bbox[3] - bbox[1]
+                    if not is_in_table(bbox):
+                        page_data["elements"].append(
+                            {
+                                "type": "image",
+                                "bbox": bbox,
+                                "width": width,
+                                "height": height,
+                                "source": "raw",
+                            }
+                        )
+                        analysis["images"].append(
+                            {"page": page_num + 1, "width": width, "height": height}
+                        )
+                        detected_image_bboxes.append(bbox)
+
+        # 2. Vector Drawings (capture charts, graphs, icons)
+        drawings = page.get_drawings()
+        for draw in drawings:
+            bbox = tuple(draw["rect"])
+            width = bbox[2] - bbox[0]
+            height = bbox[3] - bbox[1]
+
+            # Filter out tiny things (lines/borders)
+            if width < 10 or height < 10:
+                continue
+
+            # Check overlap with existing images (vectors often overlay images)
+            already_found = False
+            for existing_bbox in detected_image_bboxes:
+                if boxes_overlap(bbox, existing_bbox, tolerance=2.0):
+                    already_found = True
+                    break
+
+            if not already_found:
+                # Add as an "image" type so it gets tagged as Figure
+                if not is_in_table(bbox):
+                    page_data["elements"].append(
+                        {
+                            "type": "image",  # Treat as image for tagging purposes
+                            "bbox": bbox,
+                            "width": width,
+                            "height": height,
+                            "source": "vector",
+                            "is_vector": True,
+                        }
+                    )
+                    analysis["images"].append(
+                        {"page": page_num + 1, "width": width, "height": height}
+                    )
+                    detected_image_bboxes.append(bbox)
+
+        # Sort elements by vertical position (reading order)
+        page_data["elements"].sort(key=lambda x: (x["bbox"][1], x["bbox"][0]))
 
         # Collect link annotations
         for link in page.get_links():
@@ -1684,10 +1759,23 @@ def inject_mcids_into_page(
 
     # Graphics painting operators that draw visible content
     # These must be inside marked content (tagged or Artifact) for PDF/UA
-    graphics_paint_operators = {"f", "F", "f*", "F*", "s", "S", "b", "B", "b*", "B*"}
+    graphics_paint_operators = {
+        "f",
+        "F",
+        "f*",
+        "F*",
+        "s",
+        "S",
+        "b",
+        "B",
+        "b*",
+        "B*",
+        "sh",
+    }  # Added 'sh' (Shading)
 
     # Path construction operators (these build paths but don't paint)
-    path_construction_operators = {"m", "l", "c", "v", "y", "h", "re"}
+    # W/W* modify clipping path using current path, so they consume the path
+    path_construction_operators = {"m", "l", "c", "v", "y", "h", "re", "W", "W*"}
 
     # Second pass: inject MCIDs only for blocks with content
     new_instructions = []
@@ -1850,8 +1938,21 @@ def inject_mcids_into_page(
                 in_path = False
 
         elif op == "n":
-            # End path without painting - not visible, no artifact needed
-            # But we need to flush any buffered path ops
+            # End path without painting
+            # PDF/UA requires all content to be tagged, even invisible paths used for clipping.
+            # So if we are not in a tagged block, we must wrap this in Artifact.
+            if marked_content_depth == 0 and not in_tagged_block and path_buffer:
+                new_instructions.append(
+                    ([pikepdf.Name("/Artifact")], pikepdf.Operator("BMC"))
+                )
+                new_instructions.extend(path_buffer)
+                new_instructions.append((operands, operator))
+                new_instructions.append(([], pikepdf.Operator("EMC")))
+                path_buffer = []
+                in_path = False
+                continue
+
+            # End path without painting - flush buffer
             new_instructions.extend(path_buffer)
             path_buffer = []
             in_path = False
@@ -1956,56 +2057,11 @@ def remediate_pdf(
     bookmark_info = diagnostic.get("bookmarks", {}) if diagnostic else {}
     has_bookmarks = bookmark_info.get("has_bookmarks", False)
 
-    with pikepdf.open(str(input_path)) as pdf:
+    with pikepdf.open(str(input_path), allow_overwriting_input=True) as pdf:
         # Validate existing structure if we are asked to preserve it
         if preserve_structure and pdf.Root.get("/StructTreeRoot"):
-            # Check for broken Link structure (common in Pages/Word exports)
-            # Links must have an OBJR (Object Reference) child to be valid PDF/UA
-            link_tags = 0
-            objr_nodes = 0
-
-            def check_link_structure(elem):
-                nonlocal link_tags, objr_nodes
-                if not hasattr(elem, "get"):
-                    return
-
-                tag = str(elem.get("/S", ""))
-                if tag == "/Link":
-                    link_tags += 1
-
-                k = elem.get("/K")
-                if k:
-                    if isinstance(k, pikepdf.Dictionary):
-                        if k.get("/Type") == "/OBJR":
-                            objr_nodes += 1
-                        elif k.get("/S"):
-                            check_link_structure(k)
-                    elif is_pdf_array(k):
-                        for item in k:
-                            if isinstance(item, pikepdf.Dictionary):
-                                if item.get("/Type") == "/OBJR":
-                                    objr_nodes += 1
-                                elif item.get("/S"):
-                                    check_link_structure(item)
-
-            struct_root = pdf.Root.StructTreeRoot
-            if struct_root.get("/K"):
-                k_root = struct_root.get("/K")
-                if is_pdf_array(k_root):
-                    for item in k_root:
-                        check_link_structure(item)
-                else:
-                    check_link_structure(k_root)
-
-            # Heuristic: If we have Links but no OBJRs, the structure is broken
-            if link_tags > 0 and objr_nodes == 0:
-                print(
-                    f"  ⚠ Detected {link_tags} Link tags but 0 annotation references (OBJR)."
-                )
-                print(
-                    "  Existing structure is broken. Switching to FORCE REBUILD mode."
-                )
-                preserve_structure = False
+            # We trust process_pdf to have done the deep analysis checks
+            pass
 
         # Set document language (only if diagnostic says it's missing)
         if not has_lang:
@@ -2274,6 +2330,40 @@ def remediate_pdf(
             # Generate bookmarks from existing structure if missing
             if not has_bookmarks:
                 generate_bookmarks_from_structure(pdf)
+
+            # Apply alt text updates if provided
+            if alt_texts:
+                # Use a list to hold the mutable counter
+                counter = [0]
+
+                def update_alt_text(elem):
+                    # Check if this is a structure element
+                    if hasattr(elem, "get") and elem.get("/S"):
+                        tag = str(elem.get("/S", ""))
+                        if "Figure" in tag:
+                            counter[0] += 1
+                            current_num = counter[0]
+                            if current_num in alt_texts:
+                                elem["/Alt"] = pikepdf.String(alt_texts[current_num])
+
+                    # Recurse into children
+                    k = elem.get("/K") if hasattr(elem, "get") else None
+                    if k:
+                        if isinstance(k, pikepdf.Array):
+                            for child in k:
+                                update_alt_text(child)
+                        elif hasattr(k, "get"):  # Single child dictionary
+                            update_alt_text(k)
+
+                # Start processing from the document element(s)
+                if struct_tree:
+                    doc_elem_root = struct_tree.get("/K")
+                    if doc_elem_root:
+                        if isinstance(doc_elem_root, pikepdf.Array):
+                            for item in doc_elem_root:
+                                update_alt_text(item)
+                        else:
+                            update_alt_text(doc_elem_root)
 
             pdf.save(str(output_path))
             return title
@@ -2842,6 +2932,19 @@ def process_pdf(input_path: Path, force: bool = False) -> int:
     # Use --force to override and rebuild from scratch
     preserve_structure = has_tagged and not force
 
+    # Check for broken link structure (orphaned Link tags without OBJR)
+    if preserve_structure:
+        struct_analysis = pre_results.get("deep_analysis", {})
+        link_stats = struct_analysis.get("links", {})
+        total_links = link_stats.get("count", 0)
+        valid_links = link_stats.get("with_content", 0) + link_stats.get("objr_only", 0)
+
+        # If we have Link tags but NONE of them have OBJR annotations, structure is broken
+        if total_links > 0 and valid_links == 0:
+            print("  ⚠ Detected broken structure (Link tags without annotations).")
+            print("  Switching to FORCE REBUILD mode.")
+            preserve_structure = False
+
     # Report current status
     if pre_results["summary"]["failed"] == 0 and pre_results["summary"]["warned"] == 0:
         print("  ✓ PDF is already fully accessible!")
@@ -2902,7 +3005,7 @@ def process_pdf(input_path: Path, force: bool = False) -> int:
     needs_review = 0
 
     if has_figures:
-        if struct_figures.get("count", 0) > 0:
+        if struct_figures.get("count", 0) > 0 and preserve_structure:
             # Use structure analysis to determine review needs
             # Check for missing, empty, or placeholder alt text
             for _, alt, _ in struct_figures.get("alt_texts", []):
@@ -2939,7 +3042,7 @@ def process_pdf(input_path: Path, force: bool = False) -> int:
                 analysis,
                 images,
                 review_dir,
-                structure_analysis=struct_analysis,
+                structure_analysis=struct_analysis if preserve_structure else None,
             )
 
     # Ensure review_dir exists for reports
@@ -3600,10 +3703,46 @@ def process_markdown(md_path: Path) -> int:
         return 1
 
     print(f"Applying {len(alt_texts)} alt text description(s) to: {accessible_pdf}")
-    apply_alt_text_to_pdf(str(accessible_pdf), alt_texts)
-    print(f"\nDone! Updated: {accessible_pdf}")
 
-    return 0
+    # We use remediate_pdf with preserve_structure=True instead of just updating tags.
+    # This ensures that we also rebuild ParentTree and fix other structural issues
+    # that might have been flagged as warnings in the first pass.
+    # This fulfills the user requirement: "Even if we have to run the entire pdf back through the fixer."
+
+    print("Re-processing PDF structure to ensure compliance...")
+    try:
+        # We need fresh analysis and diagnostic for the remediation step
+        # Note: We analyze the ALREADY ACCESSIBLE PDF, which is what we want to enhance
+        analysis = analyze_document(accessible_pdf)
+        diagnostic = gather_accessibility_info(accessible_pdf)
+
+        # Overwrite the file with the enhanced version containing alt text
+        remediate_pdf(
+            accessible_pdf,
+            accessible_pdf,
+            analysis,
+            alt_texts=alt_texts,
+            preserve_structure=True,
+            diagnostic=diagnostic,
+        )
+
+        print(f"\nDone! Updated: {accessible_pdf}")
+
+        # Run a final verification to show the user the result
+        print("\nVerifying updated PDF...")
+        check_results = gather_accessibility_info(accessible_pdf)
+
+        # Summary
+        summary = check_results["summary"]
+        print(f"  - Passed:   {summary['passed']}")
+        print(f"  - Warnings: {summary['warned']}")
+        print(f"  - Failed:   {summary['failed']}")
+
+        return 0
+
+    except Exception as e:
+        print(f"Error applying alt text: {e}")
+        return 1
 
 
 def main() -> int:
