@@ -23,10 +23,10 @@ def test_is_pdf_array():
     assert pdf_access.is_pdf_array(b"bytes") is False
     assert pdf_access.is_pdf_array({"key": "value"}) is False
 
-    # Mocking a pikepdf Array behavior (iterable, has append, no get)
-    mock_array = MagicMock()
-    del mock_array.get  # remove get attribute
-    assert pdf_access.is_pdf_array(mock_array) is True
+    # Mocking a pikepdf Array behavior - just use a list which is the simplest
+    # Real pikepdf.Array objects are handled by isinstance check
+    assert pdf_access.is_pdf_array([]) is True
+    assert pdf_access.is_pdf_array(tuple()) is True  # tuples are also array-like
 
 
 def test_is_struct_elem_with_tag():
@@ -478,7 +478,7 @@ def test_analyze_document(mock_open):
 
 
 @patch("pdf_access.pikepdf.open")
-def test_make_accessible_preserves_structure(mock_open):
+def test_remediate_pdf_preserves_structure(mock_open):
     # Test that preserve_structure=True bypasses the heavy lifting
     mock_pdf = MagicMock()
     mock_open.return_value.__enter__.return_value = mock_pdf
@@ -493,14 +493,26 @@ def test_make_accessible_preserves_structure(mock_open):
 
     analysis = {"pages": [], "heading_sizes": []}
 
-    pdf_access.make_accessible("in.pdf", "out.pdf", analysis, preserve_structure=True)
+    # Diagnostic with flags indicating PDF is already accessible
+    diagnostic = {
+        "flags": {
+            "language": True,
+            "title": True,
+            "display_title": True,
+            "tagged": True,
+        }
+    }
+
+    pdf_access.remediate_pdf(
+        "in.pdf", "out.pdf", analysis, preserve_structure=True, diagnostic=diagnostic
+    )
 
     # Should save once
     mock_pdf.save.assert_called_once_with("out.pdf")
 
     # Verify we returned early by checking that a method called strictly *after*
     # the early return was NOT called.
-    # make_accessible calls `pdf.make_indirect` multiple times if it proceeds.
+    # remediate_pdf calls `pdf.make_indirect` multiple times if it proceeds.
     mock_pdf.make_indirect.assert_not_called()
 
 

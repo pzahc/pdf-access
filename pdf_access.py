@@ -36,7 +36,13 @@ CATEGORIES = [
     "Document Settings",
     "Fonts",
     "Document Structure",
+    "Headings",
+    "Lists",
+    "Tables",
+    "Links",
     "Images & Alt Text",
+    "Navigation",
+    "Metadata",
     "Advanced (PDF/UA)",
 ]
 
@@ -56,12 +62,22 @@ def is_mcid_value(val) -> bool:
 
 
 def is_pdf_array(val) -> bool:
-    """Check if value is a pikepdf Array (iterable but not dict/str)."""
-    if isinstance(val, (str, bytes)):
+    """Check if value is a pikepdf Array or Python list (not dict/str)."""
+    # Check for pikepdf.Array first
+    if isinstance(val, pikepdf.Array):
+        return True
+    # Also accept Python lists (for testing with mocks)
+    if isinstance(val, list):
+        return True
+    # For other iterables, check it's not a dict-like or string
+    if isinstance(val, (str, bytes, dict)):
         return False
-    if not hasattr(val, "__iter__"):
+    if isinstance(val, pikepdf.Dictionary):
         return False
-    return hasattr(val, "append") or not hasattr(val, "get")
+    # For mock objects in tests, check if iterable but not dict-like
+    if hasattr(val, "__iter__") and not hasattr(val, "keys"):
+        return True
+    return False
 
 
 def is_struct_elem(elem) -> bool:
@@ -100,10 +116,14 @@ def _count_structure_tags(struct_tree) -> Dict[str, Any]:
             tag_counts[tag] = tag_counts.get(tag, 0) + 1
 
             if tag == "Figure":
+                # Check both /Alt and /ActualText (Pages may use either)
                 alt = elem.get("/Alt")
-                if alt:
-                    alt_str = str(alt)
-                    if "alt text needed" in alt_str.lower() or alt_str == "":
+                actual_text = elem.get("/ActualText")
+                description = alt or actual_text
+
+                if description:
+                    desc_str = str(description)
+                    if "alt text needed" in desc_str.lower() or desc_str == "":
                         result["figures_with_placeholder"] += 1
                     else:
                         result["figures_with_alt"] += 1
@@ -216,6 +236,533 @@ def _check_for_mcids(struct_tree) -> bool:
     return found_mcid
 
 
+def _count_empty_marked_content(pdf) -> int:
+    """
+    Count marked content blocks (BDC/EMC with MCID) that contain no actual content.
+
+    PDF/UA requires that all marked content blocks contain real content (text, images, etc.).
+    Empty blocks (e.g., font-setup-only BT/ET) are a compliance violation.
+
+    Returns the count of empty marked content blocks.
+    """
+    import re
+
+    empty_count = 0
+
+    for page in pdf.pages:
+        content = page.get("/Contents")
+        if not content:
+            continue
+
+        try:
+            if isinstance(content, pikepdf.Array):
+                # Array of content streams
+                raw = b"".join(c.read_bytes() for c in content)
+            else:
+                raw = content.read_bytes()
+        except Exception:
+            continue
+
+        text = raw.decode("latin-1", errors="replace")
+
+        # Find all BDC...EMC blocks with MCIDs
+        # Pattern: /TagName << /MCID n >> BDC ... EMC
+        pattern = r"/\w+\s*<<\s*/MCID\s+\d+\s*>>\s*BDC(.*?)EMC"
+
+        for match in re.finditer(pattern, text, re.DOTALL):
+            content_block = match.group(1)
+
+            # Check if block contains actual content:
+            # - Text: Tj or TJ operators
+            # - Image/XObject: Do operator
+            has_text = bool(re.search(r"Tj|TJ", content_block))
+            has_image = bool(re.search(r"/[^\s]+\s+Do", content_block))
+
+            if not has_text and not has_image:
+                empty_count += 1
+
+    return empty_count
+
+
+def _count_untagged_graphics(pdf) -> Dict[str, Any]:
+    """
+    Count graphics operators (path painting) that are outside any marked content.
+
+    PDF/UA requires ALL content to be either:
+    1. Inside tagged marked content (BDC/EMC with structure), OR
+    2. Marked as Artifact (decorative)
+
+    Graphics operators outside both are a compliance violation.
+
+    Returns dict with:
+        - total: total untagged graphics count
+        - by_page: dict mapping page number to count
+        - operators: dict mapping operator type to count
+    """
+    import re
+
+    # Path painting operators that draw visible content
+    # f, F = fill (nonzero winding)
+    # f*, F* = fill (even-odd)
+    # s, S = stroke (s closes path first)
+    # b, B = fill + stroke (nonzero), b closes path first
+    # b*, B* = fill + stroke (even-odd), b* closes path first
+    # Note: n = end path without painting (no-op, doesn't need marking)
+    graphics_operators = {"f", "F", "f*", "F*", "s", "S", "b", "B", "b*", "B*"}
+
+    result = {
+        "total": 0,
+        "by_page": {},
+        "operators": {},
+    }
+
+    for page_num, page in enumerate(pdf.pages):
+        content = page.get("/Contents")
+        if not content:
+            continue
+
+        try:
+            if isinstance(content, pikepdf.Array):
+                raw = b"".join(c.read_bytes() for c in content)
+            else:
+                raw = content.read_bytes()
+        except Exception:
+            continue
+
+        text = raw.decode("latin-1", errors="replace")
+
+        # Split into marked regions and unmarked regions
+        # Find all BDC...EMC and BMC...EMC blocks
+        # Pattern captures both structured (BDC) and simple (BMC) marked content
+        marked_regions = []
+
+        # Pattern for tagged content: /Tag << ... >> BDC ... EMC
+        for match in re.finditer(r"/\w+\s*<<[^>]*>>\s*BDC.*?EMC", text, re.DOTALL):
+            marked_regions.append((match.start(), match.end()))
+
+        # Pattern for artifact content: /Artifact BMC ... EMC or /Artifact << ... >> BDC ... EMC
+        for match in re.finditer(r"/Artifact\s+BMC.*?EMC", text, re.DOTALL):
+            marked_regions.append((match.start(), match.end()))
+        for match in re.finditer(r"/Artifact\s*<<[^>]*>>\s*BDC.*?EMC", text, re.DOTALL):
+            marked_regions.append((match.start(), match.end()))
+
+        # Sort marked regions by start position
+        marked_regions.sort()
+
+        def is_in_marked_region(pos):
+            """Check if position is inside any marked content region."""
+            for start, end in marked_regions:
+                if start <= pos < end:
+                    return True
+                if start > pos:  # Regions are sorted, no need to continue
+                    break
+            return False
+
+        # Find all graphics operators and check if they're in marked content
+        page_count = 0
+        for match in re.finditer(r"\b([fFsSnbB]\*?)\b", text):
+            op = match.group(1)
+            if op in graphics_operators:
+                if not is_in_marked_region(match.start()):
+                    page_count += 1
+                    result["operators"][op] = result["operators"].get(op, 0) + 1
+
+        if page_count > 0:
+            result["by_page"][page_num + 1] = page_count
+            result["total"] += page_count
+
+    return result
+
+
+def _analyze_structure_deeply(struct_tree, pdf) -> Dict[str, Any]:
+    """
+    Perform deep analysis of structure tree for PDF/UA compliance.
+    Returns detailed information about headings, lists, tables, links, etc.
+    """
+    analysis = {
+        # Heading analysis
+        "headings": [],  # List of (level, text_preview) in document order
+        "heading_hierarchy_issues": [],  # List of issues like "H3 after H1 (skipped H2)"
+        # List analysis
+        "lists": {
+            "count": 0,
+            "well_formed": 0,
+            "malformed": [],  # List of issues
+        },
+        # Table analysis
+        "tables": {
+            "count": 0,
+            "with_headers": 0,
+            "without_headers": 0,
+            "issues": [],
+        },
+        # Link analysis
+        "links": {
+            "count": 0,
+            "with_content": 0,  # Have both OBJR and text
+            "objr_only": 0,  # Only have OBJR (incomplete)
+            "issues": [],
+        },
+        # Figure analysis (more detailed than _count_structure_tags)
+        "figures": {
+            "count": 0,
+            "with_alt": 0,
+            "with_empty_alt": 0,
+            "with_placeholder_alt": 0,
+            "without_alt": 0,
+            "alt_texts": [],  # List of (figure_num, alt_text) for review
+        },
+        # Role mapping
+        "has_rolemap": False,
+        "custom_roles": [],  # Roles not in standard set
+        # Document element
+        "has_document_tag": False,
+    }
+
+    # Standard PDF structure types
+    STANDARD_ROLES = {
+        "Document",
+        "Part",
+        "Art",
+        "Sect",
+        "Div",
+        "BlockQuote",
+        "Caption",
+        "TOC",
+        "TOCI",
+        "Index",
+        "NonStruct",
+        "Private",
+        "H",
+        "H1",
+        "H2",
+        "H3",
+        "H4",
+        "H5",
+        "H6",
+        "P",
+        "L",
+        "LI",
+        "Lbl",
+        "LBody",
+        "Table",
+        "TR",
+        "TH",
+        "TD",
+        "THead",
+        "TBody",
+        "TFoot",
+        "Span",
+        "Quote",
+        "Note",
+        "Reference",
+        "BibEntry",
+        "Code",
+        "Link",
+        "Annot",
+        "Ruby",
+        "RB",
+        "RT",
+        "RP",
+        "Warichu",
+        "WT",
+        "WP",
+        "Figure",
+        "Formula",
+        "Form",
+    }
+
+    last_heading_level = 0
+    figure_num = 0
+
+    def get_tag_name(elem):
+        """Get clean tag name from element."""
+        if not hasattr(elem, "get"):
+            return None
+        try:
+            s = elem.get("/S")
+            if s:
+                return str(s).replace("/", "")
+        except:
+            pass
+        return None
+
+    def analyze_elem(elem, parent_tag=None):
+        nonlocal last_heading_level, figure_num
+
+        if not hasattr(elem, "get"):
+            return
+
+        tag = get_tag_name(elem)
+        if not tag:
+            return
+
+        # Check for custom roles
+        if tag not in STANDARD_ROLES:
+            if tag not in analysis["custom_roles"]:
+                analysis["custom_roles"].append(tag)
+
+        # Document tag check
+        if tag == "Document":
+            analysis["has_document_tag"] = True
+
+        # Heading analysis
+        if tag in ("H1", "H2", "H3", "H4", "H5", "H6"):
+            level = int(tag[1])
+            analysis["headings"].append((level, tag))
+
+            # Check hierarchy
+            if last_heading_level > 0 and level > last_heading_level + 1:
+                issue = f"{tag} after H{last_heading_level} (skipped H{last_heading_level + 1})"
+                analysis["heading_hierarchy_issues"].append(issue)
+
+            last_heading_level = level
+
+        elif tag == "H":
+            # Generic heading - not ideal but valid
+            analysis["headings"].append((0, "H"))
+
+        # List analysis
+        elif tag == "L":
+            analysis["lists"]["count"] += 1
+            # Check if list has proper LI children
+            k = elem.get("/K")
+            has_li = False
+            if k:
+                if is_pdf_array(k):
+                    for child in k:
+                        if get_tag_name(child) == "LI":
+                            has_li = True
+                            break
+                elif get_tag_name(k) == "LI":
+                    has_li = True
+
+            if has_li:
+                analysis["lists"]["well_formed"] += 1
+            else:
+                analysis["lists"]["malformed"].append("List without LI children")
+
+        elif tag == "LI":
+            # Check LI has Lbl and/or LBody
+            k = elem.get("/K")
+            has_lbl_or_lbody = False
+            if k:
+                if is_pdf_array(k):
+                    for child in k:
+                        child_tag = get_tag_name(child)
+                        if child_tag in ("Lbl", "LBody"):
+                            has_lbl_or_lbody = True
+                            break
+                else:
+                    child_tag = get_tag_name(k)
+                    if child_tag in ("Lbl", "LBody"):
+                        has_lbl_or_lbody = True
+
+            # LI can have direct content or Lbl/LBody - both are valid
+            # But best practice is Lbl + LBody
+
+        # Table analysis
+        elif tag == "Table":
+            analysis["tables"]["count"] += 1
+            # Check for TH elements
+            has_th = False
+
+            def check_for_th(e):
+                nonlocal has_th
+                if has_th:
+                    return
+                t = get_tag_name(e)
+                if t == "TH":
+                    has_th = True
+                    return
+                k = e.get("/K") if hasattr(e, "get") else None
+                if k:
+                    if is_pdf_array(k):
+                        for child in k:
+                            check_for_th(child)
+                    elif hasattr(k, "get"):
+                        check_for_th(k)
+
+            check_for_th(elem)
+
+            if has_th:
+                analysis["tables"]["with_headers"] += 1
+            else:
+                analysis["tables"]["without_headers"] += 1
+                analysis["tables"]["issues"].append("Table without TH header cells")
+
+        # Link analysis
+        elif tag == "Link":
+            analysis["links"]["count"] += 1
+            k = elem.get("/K")
+            has_objr = False
+            has_content = False
+
+            if k:
+                if is_pdf_array(k):
+                    for item in k:
+                        if is_mcid_value(item):
+                            has_content = True
+                        elif hasattr(item, "get"):
+                            if item.get("/Type") == pikepdf.Name("/OBJR"):
+                                has_objr = True
+                            elif item.get("/MCID") is not None:
+                                has_content = True
+                elif hasattr(k, "get"):
+                    if k.get("/Type") == pikepdf.Name("/OBJR"):
+                        has_objr = True
+                    elif k.get("/MCID") is not None:
+                        has_content = True
+                elif is_mcid_value(k):
+                    has_content = True
+
+            if has_objr and has_content:
+                analysis["links"]["with_content"] += 1
+            elif has_objr:
+                analysis["links"]["objr_only"] += 1
+                analysis["links"]["issues"].append(
+                    "Link with annotation but no text content"
+                )
+
+        # Figure analysis
+        elif tag == "Figure":
+            figure_num += 1
+            analysis["figures"]["count"] += 1
+
+            alt = elem.get("/Alt")
+            actual_text = elem.get("/ActualText")
+            description = alt or actual_text
+
+            if description:
+                desc_str = str(description).strip()
+                if desc_str == "":
+                    analysis["figures"]["with_empty_alt"] += 1
+                    analysis["figures"]["alt_texts"].append((figure_num, "[empty]"))
+                elif "alt text needed" in desc_str.lower() or desc_str.startswith(
+                    "Image "
+                ):
+                    analysis["figures"]["with_placeholder_alt"] += 1
+                    analysis["figures"]["alt_texts"].append(
+                        (figure_num, f"[placeholder: {desc_str[:30]}...]")
+                    )
+                else:
+                    analysis["figures"]["with_alt"] += 1
+                    preview = desc_str[:50] + "..." if len(desc_str) > 50 else desc_str
+                    analysis["figures"]["alt_texts"].append((figure_num, preview))
+            else:
+                analysis["figures"]["without_alt"] += 1
+                analysis["figures"]["alt_texts"].append((figure_num, "[missing]"))
+
+        # Recurse into children
+        k = elem.get("/K")
+        if k:
+            if is_pdf_array(k):
+                for child in k:
+                    if hasattr(child, "get") and child.get("/S"):
+                        analyze_elem(child, tag)
+            elif hasattr(k, "get") and k.get("/S"):
+                analyze_elem(k, tag)
+
+    # Check RoleMap
+    role_map = struct_tree.get("/RoleMap")
+    if role_map:
+        analysis["has_rolemap"] = True
+
+    # Analyze structure
+    doc_elem = struct_tree.get("/K")
+    if doc_elem:
+        if is_struct_elem(doc_elem):
+            analyze_elem(doc_elem)
+        elif is_pdf_array(doc_elem):
+            for elem in doc_elem:
+                analyze_elem(elem)
+
+    return analysis
+
+
+def _check_bookmarks(pdf) -> Dict[str, Any]:
+    """Check document outline (bookmarks) for accessibility."""
+    result = {
+        "has_bookmarks": False,
+        "bookmark_count": 0,
+        "issues": [],
+    }
+
+    try:
+        outlines = pdf.Root.get("/Outlines")
+        if outlines:
+            result["has_bookmarks"] = True
+
+            # Count bookmarks
+            def count_bookmarks(outline_item):
+                count = 0
+                if outline_item:
+                    count = 1
+                    # Check for children
+                    first = outline_item.get("/First")
+                    if first:
+                        count += count_bookmarks(first)
+                    # Check for siblings
+                    next_item = outline_item.get("/Next")
+                    if next_item:
+                        count += count_bookmarks(next_item)
+                return count
+
+            first = outlines.get("/First")
+            if first:
+                result["bookmark_count"] = count_bookmarks(first)
+    except Exception:
+        pass
+
+    return result
+
+
+def _check_metadata_consistency(pdf) -> Dict[str, Any]:
+    """Check consistency between Info dict and XMP metadata."""
+    result = {
+        "info_title": None,
+        "xmp_title": None,
+        "title_mismatch": False,
+        "info_lang": None,
+        "root_lang": None,
+        "issues": [],
+    }
+
+    try:
+        # Get Info dict title
+        if pdf.trailer.get("/Info"):
+            info_title = pdf.trailer.Info.get("/Title")
+            if info_title:
+                result["info_title"] = str(info_title)
+
+        # Get XMP title
+        try:
+            with pdf.open_metadata() as meta:
+                xmp_title = meta.get("dc:title")
+                if xmp_title:
+                    result["xmp_title"] = str(xmp_title)
+        except Exception:
+            pass
+
+        # Check for mismatch
+        if result["info_title"] and result["xmp_title"]:
+            if result["info_title"] != result["xmp_title"]:
+                result["title_mismatch"] = True
+                result["issues"].append(
+                    "Title mismatch between Info dict and XMP metadata"
+                )
+
+        # Get language
+        root_lang = pdf.Root.get("/Lang")
+        if root_lang:
+            result["root_lang"] = str(root_lang)
+
+    except Exception:
+        pass
+
+    return result
+
+
 def select_pdf_file() -> Optional[str]:
     """Open a file picker dialog and return the selected PDF path."""
     try:
@@ -258,13 +805,15 @@ def analyze_document(pdf_path: Path | str) -> Dict[str, Any]:
 
     for page_num in range(len(doc)):
         page = doc[page_num]
-        page_data = {"number": page_num, "elements": [], "tables": []}
+        page_height = page.rect.height
+        page_data = {"number": page_num, "elements": [], "tables": [], "links": []}
 
-        # Detect tables first so we can exclude table text from regular text flow
+        # Detect tables and track cell bboxes for proper MCID linking
         table_bboxes = []
+        cell_info_map = []  # List of (cell_bbox, table_idx, row_idx, cell_idx, is_header)
         try:
             tables = page.find_tables()
-            for table in tables.tables:
+            for table_idx, table in enumerate(tables.tables):
                 table_data = {
                     "bbox": table.bbox,
                     "rows": [],
@@ -273,20 +822,42 @@ def analyze_document(pdf_path: Path | str) -> Dict[str, Any]:
                 }
                 table_bboxes.append(table.bbox)
 
-                # Extract table content
+                # Extract table content and cell bboxes
                 extracted = table.extract()
-                for row_idx, row in enumerate(extracted):
+                for row_idx, row_obj in enumerate(table.rows):
+                    is_header = row_idx == 0
                     row_data = {
                         "cells": [],
-                        "is_header": row_idx == 0,  # First row is typically header
+                        "is_header": is_header,
+                        "cell_bboxes": list(row_obj.cells),  # Store cell bboxes
                     }
-                    for cell in row:
-                        row_data["cells"].append(cell if cell else "")
+                    # Store cell info for lookup
+                    for cell_idx, cell_bbox in enumerate(row_obj.cells):
+                        cell_info_map.append(
+                            (cell_bbox, table_idx, row_idx, cell_idx, is_header)
+                        )
+                    # Store extracted text
+                    if row_idx < len(extracted):
+                        for cell in extracted[row_idx]:
+                            row_data["cells"].append(cell if cell else "")
                     table_data["rows"].append(row_data)
 
                 page_data["tables"].append(table_data)
         except Exception:
             pass  # Table detection not available or failed
+
+        def find_cell_for_bbox(bbox):
+            """Find which table cell a bbox belongs to. Returns (table_idx, row_idx, cell_idx, is_header) or None."""
+            for cell_bbox, table_idx, row_idx, cell_idx, is_header in cell_info_map:
+                # Check if bbox center is within cell
+                center_x = (bbox[0] + bbox[2]) / 2
+                center_y = (bbox[1] + bbox[3]) / 2
+                if (
+                    cell_bbox[0] <= center_x <= cell_bbox[2]
+                    and cell_bbox[1] <= center_y <= cell_bbox[3]
+                ):
+                    return (table_idx, row_idx, cell_idx, is_header)
+            return None
 
         def is_in_table(bbox):
             """Check if a bbox overlaps with any detected table."""
@@ -310,14 +881,46 @@ def analyze_document(pdf_path: Path | str) -> Dict[str, Any]:
                         size = round(span["size"], 1)
                         text = span["text"].strip()
                         bbox = span["bbox"]
-                        if text and not is_in_table(bbox):
+                        if not text:
+                            continue
+
+                        # Check if this text belongs to a table cell
+                        cell_info = find_cell_for_bbox(bbox)
+
+                        if cell_info:
+                            # This text is in a table cell - include it with cell metadata
+                            table_idx, row_idx, cell_idx, is_header = cell_info
+                            page_data["elements"].append(
+                                {
+                                    "type": "table_cell",
+                                    "text": text,
+                                    "size": size,
+                                    "bbox": bbox,
+                                    "table_idx": table_idx,
+                                    "row_idx": row_idx,
+                                    "cell_idx": cell_idx,
+                                    "is_header": is_header,
+                                    "font": span.get("font", ""),
+                                }
+                            )
+                        elif not is_in_table(bbox):
+                            # Regular text outside tables
                             analysis["font_sizes"].add(size)
+                            # Extract font flags for bold detection
+                            flags = span.get("flags", 0)
+                            is_bold = bool(flags & 2**4)  # bit 4 = bold
+                            font_name = span.get("font", "").lower()
+                            # Also check font name for bold indicator
+                            if "bold" in font_name or "black" in font_name:
+                                is_bold = True
                             page_data["elements"].append(
                                 {
                                     "type": "text",
                                     "text": text,
                                     "size": size,
                                     "bbox": bbox,
+                                    "bold": is_bold,
+                                    "font": span.get("font", ""),
                                 }
                             )
             elif block["type"] == 1:  # image
@@ -339,6 +942,19 @@ def analyze_document(pdf_path: Path | str) -> Dict[str, Any]:
                         }
                     )
 
+        # Collect link annotations
+        for link in page.get_links():
+            if link.get("kind") == fitz.LINK_URI or link.get("uri"):
+                # Link rect is already in PyMuPDF coordinates
+                link_rect = link.get("from")
+                if link_rect:
+                    page_data["links"].append(
+                        {
+                            "bbox": tuple(link_rect),
+                            "uri": link.get("uri", ""),
+                        }
+                    )
+
         analysis["pages"].append(page_data)
 
     doc.close()
@@ -347,21 +963,62 @@ def analyze_document(pdf_path: Path | str) -> Dict[str, Any]:
     sizes = sorted(analysis["font_sizes"], reverse=True)
     analysis["heading_sizes"] = sizes[:3] if len(sizes) >= 3 else sizes
 
+    # Compute most common font size (likely body text)
+    size_counts: Dict[float, int] = {}
+    for page_data in analysis["pages"]:
+        for elem in page_data["elements"]:
+            if elem["type"] == "text":
+                s = elem["size"]
+                size_counts[s] = size_counts.get(s, 0) + 1
+
+    if size_counts:
+        analysis["body_size"] = max(size_counts.keys(), key=lambda s: size_counts[s])
+    else:
+        analysis["body_size"] = 12.0  # Default
+
     return analysis
 
 
-def classify_element(elem: Dict, heading_sizes: List[float]) -> str:
-    """Classify a text element as heading or paragraph."""
+def classify_element(
+    elem: Dict, heading_sizes: List[float], body_size: float = 0
+) -> str:
+    """
+    Classify a text element as heading or paragraph.
+
+    Uses multiple signals:
+    - Font size relative to body text
+    - Bold styling
+    - Text length (headings are typically short)
+    """
     if elem["type"] == "image":
         return "Figure"
 
     size = elem["size"]
+    text = elem.get("text", "")
+    is_bold = elem.get("bold", False)
+
+    # If we have heading sizes from analysis, use them
     if heading_sizes and size == heading_sizes[0]:
         return "H1"
     elif len(heading_sizes) > 1 and size == heading_sizes[1]:
         return "H2"
     elif len(heading_sizes) > 2 and size == heading_sizes[2]:
         return "H3"
+
+    # Additional heuristics for edge cases:
+    # If text is bold, larger than body, and short - likely a heading
+    if body_size > 0 and size > body_size:
+        text_len = len(text)
+        # Short bold text that's larger than body = likely heading
+        if is_bold and text_len < 100:
+            size_ratio = size / body_size
+            if size_ratio >= 1.5:
+                return "H1"
+            elif size_ratio >= 1.25:
+                return "H2"
+            elif size_ratio >= 1.1:
+                return "H3"
+
     return "P"
 
 
@@ -627,48 +1284,356 @@ def apply_alt_text_to_pdf(pdf_path: Path | str, alt_texts: Dict[int, str]) -> No
         pdf.save(str(pdf_path))
 
 
+def boxes_overlap(box1, box2, tolerance=2.0):
+    """Check if two bounding boxes overlap (with small tolerance for rounding)."""
+    # box format: (x0, y0, x1, y1)
+    return (
+        box1[0] < box2[2] + tolerance
+        and box1[2] > box2[0] - tolerance
+        and box1[1] < box2[3] + tolerance
+        and box1[3] > box2[1] - tolerance
+    )
+
+
+def generate_bookmarks_from_structure(pdf) -> int:
+    """
+    Generate bookmarks/outlines from heading structure elements.
+
+    Walks the structure tree to find H1-H6 elements and creates
+    corresponding bookmark entries.
+
+    Returns the number of bookmarks created.
+    """
+    struct_tree = pdf.Root.get("/StructTreeRoot")
+    if not struct_tree:
+        return 0
+
+    # Build page objgen to index mapping
+    page_objgen_to_idx = {}
+    for idx, page in enumerate(pdf.pages):
+        page_objgen_to_idx[page.obj.objgen] = idx
+
+    # Collect headings from structure tree
+    headings = []  # List of (level, title, page_idx)
+
+    def extract_text_from_elem(elem) -> str:
+        """Try to extract text content from a structure element."""
+        # Check for ActualText first
+        actual_text = elem.get("/ActualText")
+        if actual_text:
+            return str(actual_text)
+
+        # Check for Alt text
+        alt = elem.get("/Alt")
+        if alt:
+            return str(alt)
+
+        # No direct text available - would need to look at content stream
+        return ""
+
+    def find_headings(elem, parent_page_idx=None):
+        """Recursively find heading elements."""
+        if not hasattr(elem, "get"):
+            return
+
+        # Get page reference
+        pg = elem.get("/Pg")
+        if pg is not None:
+            page_idx = page_objgen_to_idx.get(pg.objgen, parent_page_idx)
+        else:
+            page_idx = parent_page_idx
+
+        # Check if this is a heading
+        tag = elem.get("/S")
+        if tag:
+            tag_str = str(tag).replace("/", "")
+            if tag_str in ("H1", "H2", "H3", "H4", "H5", "H6"):
+                level = int(tag_str[1])
+                title = extract_text_from_elem(elem)
+                if not title:
+                    title = f"Section ({tag_str})"
+                # Truncate long titles
+                if len(title) > 80:
+                    title = title[:77] + "..."
+                if page_idx is not None:
+                    headings.append((level, title, page_idx))
+            elif tag_str == "H":
+                # Generic heading - treat as H1
+                title = extract_text_from_elem(elem)
+                if not title:
+                    title = "Section"
+                if page_idx is not None:
+                    headings.append((1, title, page_idx))
+
+        # Recurse into children
+        k = elem.get("/K")
+        if k is not None:
+            if is_pdf_array(k):
+                for child in k:
+                    if hasattr(child, "get"):
+                        find_headings(child, page_idx)
+            elif hasattr(k, "get"):
+                find_headings(k, page_idx)
+
+    # Walk structure tree
+    doc_elem = struct_tree.get("/K")
+    if doc_elem:
+        if is_pdf_array(doc_elem):
+            for child in doc_elem:
+                find_headings(child)
+        else:
+            find_headings(doc_elem)
+
+    if not headings:
+        return 0
+
+    # Create bookmarks using pikepdf's outline API
+    from pikepdf import OutlineItem
+
+    with pdf.open_outline() as outline:
+        # Clear existing outlines
+        outline.root.clear()
+
+        # Build hierarchical structure
+        # Stack of (level, outline_item) for nesting
+        stack = []
+
+        for level, title, page_idx in headings:
+            item = OutlineItem(title, page_idx)
+
+            # Find the right parent based on level
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+
+            if stack:
+                # Add as child of the most recent lower-level heading
+                stack[-1][1].children.append(item)
+            else:
+                # Top-level item
+                outline.root.append(item)
+
+            stack.append((level, item))
+
+    return len(headings)
+
+
+def generate_bookmarks_from_analysis(pdf, analysis: Dict[str, Any]) -> int:
+    """
+    Generate bookmarks from content analysis (for newly tagged PDFs).
+
+    Uses the heading detection from analyze_document() to create bookmarks.
+
+    Returns the number of bookmarks created.
+    """
+    headings = []  # List of (level, title, page_idx)
+    heading_sizes = analysis.get("heading_sizes", [])
+    body_size = analysis.get("body_size", 12.0)
+
+    for page_data in analysis["pages"]:
+        page_idx = page_data["number"]
+        for elem in page_data["elements"]:
+            if elem["type"] == "text":
+                tag = classify_element(elem, heading_sizes, body_size)
+                if tag in ("H1", "H2", "H3"):
+                    level = int(tag[1])
+                    title = elem["text"]
+                    if len(title) > 80:
+                        title = title[:77] + "..."
+                    headings.append((level, title, page_idx))
+
+    if not headings:
+        return 0
+
+    from pikepdf import OutlineItem
+
+    with pdf.open_outline() as outline:
+        outline.root.clear()
+
+        stack = []
+        for level, title, page_idx in headings:
+            item = OutlineItem(title, page_idx)
+
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+
+            if stack:
+                stack[-1][1].children.append(item)
+            else:
+                outline.root.append(item)
+
+            stack.append((level, item))
+
+    return len(headings)
+
+
 def inject_mcids_into_page(
     pdf,
     page,
     analysis_elements: List[Dict],
     heading_sizes: List[float],
     start_mcid: int = 0,
+    links: Optional[List[Dict]] = None,
 ) -> tuple:
     """
     Inject BDC/EMC markers into a page's content stream.
     Returns (mcid_info_list, next_mcid) where mcid_info contains tag type for each MCID.
+    mcid_info items may include 'link_index' if the text overlaps with a link annotation.
+    mcid_info items may include 'table_cell' info for cells (table_idx, row_idx, cell_idx, is_header).
+
+    Only BT...ET blocks with actual content (text operators like Tj, TJ, ', ") get MCIDs.
+    Empty font-setup blocks are not tagged to avoid PDF/UA Content errors.
+    Graphics painting operators (S, f, f*, etc.) outside marked content are marked as Artifacts.
+
+    If the page already has marked content (BDC/BMC/EMC), it is stripped first to avoid
+    duplicate tagging when re-processing an already-tagged PDF.
     """
-    instructions = list(pikepdf.parse_content_stream(page))
+    raw_instructions = list(pikepdf.parse_content_stream(page))
+
+    # Step 0: Strip existing marked content operators (BDC, BMC, EMC)
+    # This allows re-processing of already-tagged PDFs without duplicating markers
+    instructions = []
+    for operands, operator in raw_instructions:
+        op = str(operator)
+        if op in ("BDC", "BMC", "EMC"):
+            # Skip existing marked content markers
+            continue
+        instructions.append((operands, operator))
+
+    # First pass: identify which BT...ET blocks have actual text content
+    # Text operators: Tj, TJ, ', "
+    text_operators = {"Tj", "TJ", "'", '"'}
+    bt_has_content = []  # True/False for each BT...ET block
+
+    in_text_block = False
+    current_block_has_content = False
+
+    for operands, operator in instructions:
+        op = str(operator)
+        if op == "BT":
+            in_text_block = True
+            current_block_has_content = False
+        elif op == "ET":
+            bt_has_content.append(current_block_has_content)
+            in_text_block = False
+        elif in_text_block and op in text_operators:
+            current_block_has_content = True
+
+    # Graphics painting operators that draw visible content
+    # These must be inside marked content (tagged or Artifact) for PDF/UA
+    graphics_paint_operators = {"f", "F", "f*", "F*", "s", "S", "b", "B", "b*", "B*"}
+
+    # Path construction operators (these build paths but don't paint)
+    path_construction_operators = {"m", "l", "c", "v", "y", "h", "re"}
+
+    # Second pass: inject MCIDs only for blocks with content
     new_instructions = []
     mcid = start_mcid
     mcid_info = []
+    links = links or []
 
-    # Track which analysis element we're on (text blocks map to analysis)
+    # Track which analysis element we're on (text and table_cell blocks map to analysis)
     text_block_index = 0
-    text_elements = [e for e in analysis_elements if e["type"] == "text"]
+    # Include both regular text and table cell text
+    text_elements = [
+        e for e in analysis_elements if e["type"] in ("text", "table_cell")
+    ]
     image_index = 0
     image_elements = [e for e in analysis_elements if e["type"] == "image"]
+
+    bt_block_index = 0  # Index into bt_has_content
+    in_tagged_block = False  # Are we in a BT block that we tagged?
+    marked_content_depth = 0  # Track nested BDC/BMC...EMC
+
+    # Track path construction for artifact wrapping
+    path_buffer = []  # Buffer path construction ops to wrap with paint op
+    in_path = False
 
     for operands, operator in instructions:
         op = str(operator)
 
-        if op == "BT":
-            # Determine tag type from analysis
-            if text_block_index < len(text_elements):
-                elem = text_elements[text_block_index]
-                tag = classify_element(elem, heading_sizes)
-                text_block_index += 1
-            else:
-                tag = "P"
+        # Track existing marked content nesting
+        if op in ("BDC", "BMC"):
+            marked_content_depth += 1
+        elif op == "EMC":
+            marked_content_depth -= 1
 
-            bdc_operands = [
-                pikepdf.Name(f"/{tag}"),
-                pikepdf.Dictionary({"/MCID": mcid}),
-            ]
-            new_instructions.append((bdc_operands, pikepdf.Operator("BDC")))
-            mcid_info.append({"type": "text", "tag": tag, "mcid": mcid})
+        if op == "BT":
+            # Flush any pending path as artifact before text block
+            if path_buffer:
+                new_instructions.append(
+                    ([pikepdf.Name("/Artifact")], pikepdf.Operator("BMC"))
+                )
+                new_instructions.extend(path_buffer)
+                new_instructions.append(([], pikepdf.Operator("EMC")))
+                path_buffer = []
+                in_path = False
+
+            # Check if this block has content
+            has_content = (
+                bt_block_index < len(bt_has_content) and bt_has_content[bt_block_index]
+            )
+            bt_block_index += 1
+
+            if has_content:
+                # Determine tag type from analysis
+                link_index = None
+                table_cell_info = None
+
+                if text_block_index < len(text_elements):
+                    elem = text_elements[text_block_index]
+
+                    if elem["type"] == "table_cell":
+                        # Table cell - use TH or TD based on is_header
+                        tag = "TH" if elem.get("is_header") else "TD"
+                        table_cell_info = {
+                            "table_idx": elem["table_idx"],
+                            "row_idx": elem["row_idx"],
+                            "cell_idx": elem["cell_idx"],
+                            "is_header": elem["is_header"],
+                        }
+                    else:
+                        # Regular text - classify as heading or paragraph
+                        tag = classify_element(elem, heading_sizes)
+
+                    # Check if this text overlaps with any link annotation
+                    text_bbox = elem.get("bbox")
+                    if text_bbox:
+                        for idx, link in enumerate(links):
+                            link_bbox = link.get("bbox")
+                            if link_bbox and boxes_overlap(text_bbox, link_bbox):
+                                link_index = idx
+                                break
+
+                    text_block_index += 1
+                else:
+                    tag = "P"
+
+                bdc_operands = [
+                    pikepdf.Name(f"/{tag}"),
+                    pikepdf.Dictionary({"/MCID": mcid}),
+                ]
+                new_instructions.append((bdc_operands, pikepdf.Operator("BDC")))
+                info = {"type": "text", "tag": tag, "mcid": mcid}
+                if link_index is not None:
+                    info["link_index"] = link_index
+                if table_cell_info is not None:
+                    info["table_cell"] = table_cell_info
+                mcid_info.append(info)
+                in_tagged_block = True
+            else:
+                in_tagged_block = False
 
         elif op == "Do":
+            # Flush any pending path as artifact before image
+            if path_buffer:
+                new_instructions.append(
+                    ([pikepdf.Name("/Artifact")], pikepdf.Operator("BMC"))
+                )
+                new_instructions.extend(path_buffer)
+                new_instructions.append(([], pikepdf.Operator("EMC")))
+                path_buffer = []
+                in_path = False
+
             # Image/XObject
             if image_index < len(image_elements):
                 image_index += 1
@@ -684,11 +1649,98 @@ def inject_mcids_into_page(
             mcid += 1
             continue
 
+        elif op in path_construction_operators:
+            # Start or continue path construction
+            # Only buffer if we're not already inside marked content
+            if marked_content_depth == 0 and not in_tagged_block:
+                in_path = True
+                path_buffer.append((operands, operator))
+                continue
+            # Otherwise, just add normally (already in marked content)
+
+        elif op in graphics_paint_operators:
+            # Paint operator - completes a path
+            if marked_content_depth == 0 and not in_tagged_block:
+                # Not in any marked content - wrap path + paint as Artifact
+                new_instructions.append(
+                    ([pikepdf.Name("/Artifact")], pikepdf.Operator("BMC"))
+                )
+                new_instructions.extend(path_buffer)
+                new_instructions.append((operands, operator))
+                new_instructions.append(([], pikepdf.Operator("EMC")))
+                path_buffer = []
+                in_path = False
+                continue
+            else:
+                # Inside marked content - flush buffer and add paint op normally
+                new_instructions.extend(path_buffer)
+                path_buffer = []
+                in_path = False
+
+        elif op == "n":
+            # End path without painting - not visible, no artifact needed
+            # But we need to flush any buffered path ops
+            new_instructions.extend(path_buffer)
+            path_buffer = []
+            in_path = False
+
+        # Flush path buffer if we hit a non-path operator (except graphics state)
+        # Graphics state operators include:
+        # - q, Q: save/restore graphics state
+        # - cm: transformation matrix
+        # - w, J, j, M, d: line width, cap, join, miter limit, dash
+        # - ri, i, gs: rendering intent, flatness, graphics state dict
+        # - CS, cs, SC, SCN, sc, scn: color space and color
+        # - G, g, RG, rg, K, k: gray, RGB, CMYK colors
+        graphics_state_ops = {
+            "q",
+            "Q",
+            "cm",
+            "w",
+            "J",
+            "j",
+            "M",
+            "d",
+            "ri",
+            "i",
+            "gs",
+            "CS",
+            "cs",
+            "SC",
+            "SCN",
+            "sc",
+            "scn",
+            "G",
+            "g",
+            "RG",
+            "rg",
+            "K",
+            "k",
+        }
+        if (
+            in_path
+            and op not in path_construction_operators
+            and op not in graphics_paint_operators
+            and op not in graphics_state_ops
+            and op != "n"
+        ):
+            # Non-path operator while building path - flush buffer
+            new_instructions.extend(path_buffer)
+            path_buffer = []
+            in_path = False
+
         new_instructions.append((operands, operator))
 
-        if op == "ET":
+        if op == "ET" and in_tagged_block:
             new_instructions.append(([], pikepdf.Operator("EMC")))
             mcid += 1
+            in_tagged_block = False  # Reset after closing the tag
+
+    # Flush any remaining path buffer at end (shouldn't happen normally)
+    if path_buffer:
+        new_instructions.append(([pikepdf.Name("/Artifact")], pikepdf.Operator("BMC")))
+        new_instructions.extend(path_buffer)
+        new_instructions.append(([], pikepdf.Operator("EMC")))
 
     # Write new content stream
     new_content = pikepdf.unparse_content_stream(new_instructions)
@@ -697,34 +1749,57 @@ def inject_mcids_into_page(
     return mcid_info, mcid
 
 
-def make_accessible(
+def remediate_pdf(
     input_path: Path | str,
     output_path: Path | str,
     analysis: Dict[str, Any],
     alt_texts: Optional[Dict[int, str]] = None,
     preserve_structure: bool = False,
+    diagnostic: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
-    Add accessibility tags to PDF using pikepdf with proper MCID linking.
-    If preserve_structure is True, only fix metadata without touching existing tags.
+    Remediate PDF accessibility issues based on analysis and diagnostic.
+
+    Fixes include: language, title, display title, structure tree, MCIDs,
+    ParentTree, tab order, and link tagging.
+
+    Args:
+        input_path: Path to source PDF
+        output_path: Path for output PDF
+        analysis: Content analysis from analyze_document()
+        alt_texts: Optional dict mapping figure number to alt text
+        preserve_structure: If True, enhance existing structure without rebuilding
+        diagnostic: Results from gather_accessibility_info() - used to determine what needs fixing
+
     Returns the document title.
     """
+    # Extract flags from diagnostic if provided, otherwise we'll check directly
+    flags = diagnostic.get("flags", {}) if diagnostic else {}
+    has_lang = flags.get("language", False)
+    has_title = flags.get("title", False)
+    has_display_title = flags.get("display_title", False)
+    has_tagged = flags.get("tagged", False)
+
+    # Check for bookmarks from diagnostic
+    bookmark_info = diagnostic.get("bookmarks", {}) if diagnostic else {}
+    has_bookmarks = bookmark_info.get("has_bookmarks", False)
+
     with pikepdf.open(str(input_path)) as pdf:
-        # Set document language (only if not already set)
-        existing_lang = pdf.Root.get("/Lang")
-        if not existing_lang:
+        # Set document language (only if diagnostic says it's missing)
+        if not has_lang:
             pdf.Root.Lang = pikepdf.String("en-US")
             lang_to_use = "en-US"
         else:
-            lang_to_use = str(existing_lang)
+            lang_to_use = str(pdf.Root.get("/Lang", "en-US"))
 
-        # Set ViewerPreferences
-        if "/ViewerPreferences" not in pdf.Root:
-            pdf.Root.ViewerPreferences = pikepdf.Dictionary()
-        pdf.Root.ViewerPreferences.DisplayDocTitle = True
+        # Set ViewerPreferences (only if diagnostic says display title is disabled)
+        if not has_display_title:
+            if "/ViewerPreferences" not in pdf.Root:
+                pdf.Root.ViewerPreferences = pikepdf.Dictionary()
+            pdf.Root.ViewerPreferences.DisplayDocTitle = True
 
-        # Set MarkInfo (only if not already set or if not preserving)
-        if not preserve_structure or not pdf.Root.get("/MarkInfo"):
+        # Set MarkInfo (only if not already tagged or if we're rebuilding)
+        if not has_tagged or not preserve_structure:
             pdf.Root.MarkInfo = pikepdf.Dictionary(
                 {
                     "/Marked": True,
@@ -732,20 +1807,15 @@ def make_accessible(
                 }
             )
 
-        # Check for existing title
-        existing_title = None
-        if pdf.trailer.get("/Info"):
-            existing_title = pdf.trailer.Info.get("/Title")
-            if existing_title:
-                existing_title = str(existing_title).strip()
-                # Ignore placeholder titles
-                if existing_title.lower() in ("", "untitled", "(anonymous)"):
-                    existing_title = None
-
-        # Use existing title if valid, otherwise find from first H1
-        if existing_title:
-            title = existing_title
+        # Determine title - use existing if valid, otherwise find from first H1
+        if has_title:
+            # Get existing title from PDF
+            existing_title = None
+            if pdf.trailer.get("/Info"):
+                existing_title = pdf.trailer.Info.get("/Title")
+            title = str(existing_title) if existing_title else Path(input_path).stem
         else:
+            # Find title from content
             title = Path(input_path).stem
             for page_data in analysis["pages"]:
                 for elem in page_data["elements"]:
@@ -757,17 +1827,24 @@ def make_accessible(
                 if title != Path(input_path).stem:
                     break
 
-        # Set title metadata
+        # Set title metadata and PDF/UA identifier
+        # Always set PDF/UA identifier for compliance
         with pdf.open_metadata() as meta:
+            # Always set title in XMP (pikepdf may reset metadata on save)
             meta["dc:title"] = title
             meta["dc:language"] = lang_to_use
+            # Add PDF/UA identifier (required for PDF/UA compliance)
+            meta["pdfuaid:part"] = "1"
+            # Also add PDF/A identifier for better compatibility
+            meta["pdfaid:part"] = "3"
+            meta["pdfaid:conformance"] = "A"
 
+        # Always ensure title is set in Info dict (pikepdf may reset it on save)
         if pdf.trailer.get("/Info"):
             pdf.trailer.Info["/Title"] = pikepdf.String(title)
             pdf.trailer.Info["/Producer"] = pikepdf.String("PDF Accessibility Tool")
             pdf.trailer.Info["/Creator"] = pikepdf.String("PDF Accessibility Tool")
         else:
-            # Create Info dict if it doesn't exist
             pdf.trailer.Info = pikepdf.Dictionary(
                 {
                     "/Title": pikepdf.String(title),
@@ -776,24 +1853,113 @@ def make_accessible(
                 }
             )
 
-        # If preserving structure, skip MCID injection and structure tree creation
-        # But still ensure tab order is set on all pages and annotations are tagged
+        # If preserving structure, enhance existing tags without rebuilding
+        # This adds missing ParentTree, StructParents, Tabs, RoleMap
         if preserve_structure:
-            struct_parent_idx = 0
+            struct_tree = pdf.Root.get("/StructTreeRoot")
+
+            # Build page objgen to index mapping (objgen is reliable for comparison)
+            page_objgen_to_idx = {}
+            for idx, page in enumerate(pdf.pages):
+                page_objgen_to_idx[page.obj.objgen] = idx
+
+            # Collect MCIDs per page from existing structure
+            # Format: page_idx -> list of (mcid, struct_elem) in MCID order
+            page_mcids: Dict[int, List[tuple]] = {i: [] for i in range(len(pdf.pages))}
+
+            def collect_mcids_from_struct(elem, parent_page_idx=None):
+                """Recursively collect MCIDs from structure elements."""
+                if not hasattr(elem, "get"):
+                    return
+
+                # Get page reference from this element or inherit from parent
+                pg = elem.get("/Pg")
+                if pg is not None:
+                    page_idx = page_objgen_to_idx.get(pg.objgen, parent_page_idx)
+                else:
+                    page_idx = parent_page_idx
+
+                k = elem.get("/K")
+                if k is not None:
+                    # K can be: int (MCID), dict, or array
+                    if is_mcid_value(k):
+                        if page_idx is not None:
+                            page_mcids[page_idx].append((int(k), elem))
+                    elif is_pdf_array(k):
+                        for item in k:
+                            if is_mcid_value(item):
+                                if page_idx is not None:
+                                    page_mcids[page_idx].append((int(item), elem))
+                            elif hasattr(item, "get"):
+                                mcid = item.get("/MCID")
+                                if mcid is not None:
+                                    if page_idx is not None:
+                                        page_mcids[page_idx].append((int(mcid), elem))
+                                elif item.get("/S"):  # Child struct elem
+                                    collect_mcids_from_struct(item, page_idx)
+                    elif hasattr(k, "get"):
+                        mcid = k.get("/MCID")
+                        if mcid is not None:
+                            if page_idx is not None:
+                                page_mcids[page_idx].append((int(mcid), elem))
+                        elif k.get("/S"):  # Child struct elem
+                            collect_mcids_from_struct(k, page_idx)
+
+            # Walk structure tree to collect MCIDs
+            if struct_tree:
+                doc_elem = struct_tree.get("/K")
+                if doc_elem:
+                    if is_pdf_array(doc_elem):
+                        for child in doc_elem:
+                            collect_mcids_from_struct(child)
+                    else:
+                        collect_mcids_from_struct(doc_elem)
+
+            # Build ParentTree from collected MCIDs
+            parent_tree_nums = []
+            for page_idx in range(len(pdf.pages)):
+                mcid_list = page_mcids[page_idx]
+                if mcid_list:
+                    # Sort by MCID to ensure correct order
+                    mcid_list.sort(key=lambda x: x[0])
+                    # Create array of struct elements in MCID order
+                    struct_elem_array = pikepdf.Array([elem for _, elem in mcid_list])
+                    parent_tree_nums.append(page_idx)
+                    parent_tree_nums.append(struct_elem_array)
+
+            # Add or update ParentTree
+            if struct_tree and parent_tree_nums:
+                parent_tree = pdf.make_indirect(
+                    pikepdf.Dictionary({"/Nums": pikepdf.Array(parent_tree_nums)})
+                )
+                struct_tree["/ParentTree"] = parent_tree
+                struct_tree["/ParentTreeNextKey"] = len(pdf.pages)
+
+            # Add empty RoleMap if missing - we use standard tags only
+            # Standard PDF 1.7 tags don't need role mapping
+            if struct_tree and not struct_tree.get("/RoleMap"):
+                struct_tree["/RoleMap"] = pikepdf.Dictionary({})
+
+            # Set Tabs and StructParents on each page
+            struct_parent_idx = len(pdf.pages)  # Start after page indices
             for page_num, page in enumerate(pdf.pages):
                 if page.get("/Tabs") != pikepdf.Name("/S"):
                     page.Tabs = pikepdf.Name("/S")
                 if page.get("/StructParents") is None:
                     page.StructParents = page_num
-                struct_parent_idx = max(struct_parent_idx, page_num + 1)
 
-                # Handle annotations (links, etc.) for tab order
+                # Handle annotations (links, etc.)
                 annots = page.get("/Annots")
                 if annots:
                     for annot in annots:
                         if annot.get("/StructParent") is None:
                             annot["/StructParent"] = struct_parent_idx
                             struct_parent_idx += 1
+
+            # Generate bookmarks from existing structure if missing
+            if not has_bookmarks:
+                generate_bookmarks_from_structure(pdf)
+
             pdf.save(str(output_path))
             return title
 
@@ -809,6 +1975,9 @@ def make_accessible(
                 else {"elements": []}
             )
 
+            # Get links from analysis for this page
+            page_links = page_analysis.get("links", [])
+
             # Inject MCIDs into this page's content stream
             mcid_info, _ = inject_mcids_into_page(
                 pdf,
@@ -816,11 +1985,32 @@ def make_accessible(
                 page_analysis["elements"],
                 analysis["heading_sizes"],
                 start_mcid=0,  # MCIDs reset per page
+                links=page_links,
             )
 
             # Create structure elements for this page
-            page_struct_elems = []
+            # First, organize table cell MCIDs by table/row/cell
+            table_cell_mcids = {}  # (table_idx, row_idx, cell_idx) -> list of mcid_info
+            non_table_mcid_info = []
+
             for info in mcid_info:
+                if "table_cell" in info:
+                    tc = info["table_cell"]
+                    key = (tc["table_idx"], tc["row_idx"], tc["cell_idx"])
+                    if key not in table_cell_mcids:
+                        table_cell_mcids[key] = []
+                    table_cell_mcids[key].append(info)
+                else:
+                    non_table_mcid_info.append(info)
+
+            # Map MCID -> struct elem for ParentTree
+            mcid_to_struct_elem = {}
+
+            # Track page-local figure count for bbox lookup
+            page_figure_count = 0
+
+            # Create structure elements for non-table content
+            for info in non_table_mcid_info:
                 tag = info["tag"]
                 mcid = info["mcid"]
 
@@ -835,18 +2025,42 @@ def make_accessible(
                     )
                 )
 
-                # Add alt text for figures
+                # Add alt text and BBox for figures
                 if tag == "Figure":
-                    figure_count += 1
+                    figure_count += 1  # Global count for alt_texts mapping
+                    page_figure_count += 1  # Page-local count for bbox lookup
+
+                    # Get image bbox from analysis for BBox attribute (required by PDF/UA)
+                    elements = page_analysis["elements"]
+                    img_elements = [e for e in elements if e["type"] == "image"]
+                    img_idx = page_figure_count - 1  # Use page-local index
+                    if img_idx < len(img_elements):
+                        img_elem = img_elements[img_idx]
+                        bbox = img_elem.get("bbox")
+                        if bbox:
+                            # BBox is [x1, y1, x2, y2] - left, bottom, right, top
+                            struct_elem["/A"] = pikepdf.Dictionary(
+                                {
+                                    "/O": pikepdf.Name("/Layout"),
+                                    "/BBox": pikepdf.Array(
+                                        [
+                                            float(bbox[0]),  # x1 (left)
+                                            float(bbox[1]),  # y1 (bottom)
+                                            float(bbox[2]),  # x2 (right)
+                                            float(bbox[3]),  # y2 (top)
+                                        ]
+                                    ),
+                                }
+                            )
+
+                    # Add alt text
                     if alt_texts and figure_count in alt_texts:
                         struct_elem["/Alt"] = pikepdf.String(alt_texts[figure_count])
                     else:
                         # Try to find caption from analysis
-                        elements = page_analysis["elements"]
                         img_indices = [
                             i for i, e in enumerate(elements) if e["type"] == "image"
                         ]
-                        img_idx = figure_count - 1
                         if img_idx < len(img_indices):
                             caption = find_image_caption(elements, img_indices[img_idx])
                             if caption:
@@ -856,42 +2070,75 @@ def make_accessible(
                                     f"Image {figure_count} - alt text needed"
                                 )
 
-                page_struct_elems.append(struct_elem)
+                mcid_to_struct_elem[mcid] = struct_elem
                 all_struct_elems.append(struct_elem)
 
-            # Create table structure elements
-            # Tables are structure-only (no MCIDs) - they organize existing content
-            for table_data in page_analysis.get("tables", []):
-                table_rows = []
+            # Create table structure elements with proper MCID linking
+            # PDF/UA requires: Table → THead → TR → TH and Table → TBody → TR → TD
+            for table_idx, table_data in enumerate(page_analysis.get("tables", [])):
+                header_rows = []  # TRs for THead
+                body_rows = []  # TRs for TBody
 
-                for row_data in table_data["rows"]:
+                for row_idx, row_data in enumerate(table_data["rows"]):
                     row_cells = []
-                    for cell_idx, cell_text in enumerate(row_data["cells"]):
+                    for cell_idx in range(len(row_data["cells"])):
+                        # Get MCIDs for this cell
+                        key = (table_idx, row_idx, cell_idx)
+                        cell_mcid_infos = table_cell_mcids.get(key, [])
+
                         # Create TH for header row, TD for data rows
                         cell_tag = "TH" if row_data["is_header"] else "TD"
-                        cell_elem = pdf.make_indirect(
-                            pikepdf.Dictionary(
+
+                        # Build /K value - single MCID or array of MCIDs
+                        if len(cell_mcid_infos) == 0:
+                            # No content found - use ActualText as fallback
+                            cell_content = (
+                                str(row_data["cells"][cell_idx])
+                                if cell_idx < len(row_data["cells"])
+                                else ""
+                            )
+                            cell_dict = {
+                                "/Type": pikepdf.Name("/StructElem"),
+                                "/S": pikepdf.Name(f"/{cell_tag}"),
+                                "/Pg": page.obj,
+                                "/ActualText": pikepdf.String(cell_content),
+                            }
+                        elif len(cell_mcid_infos) == 1:
+                            # Single MCID
+                            cell_dict = {
+                                "/Type": pikepdf.Name("/StructElem"),
+                                "/S": pikepdf.Name(f"/{cell_tag}"),
+                                "/Pg": page.obj,
+                                "/K": cell_mcid_infos[0]["mcid"],
+                            }
+                        else:
+                            # Multiple MCIDs in this cell
+                            mcid_array = pikepdf.Array(
+                                [info["mcid"] for info in cell_mcid_infos]
+                            )
+                            cell_dict = {
+                                "/Type": pikepdf.Name("/StructElem"),
+                                "/S": pikepdf.Name(f"/{cell_tag}"),
+                                "/Pg": page.obj,
+                                "/K": mcid_array,
+                            }
+
+                        # For TH, add Scope attribute (Column scope)
+                        if row_data["is_header"]:
+                            cell_dict["/A"] = pikepdf.Dictionary(
                                 {
-                                    "/Type": pikepdf.Name("/StructElem"),
-                                    "/S": pikepdf.Name(f"/{cell_tag}"),
-                                    "/Pg": page.obj,
-                                    # For TH, add Scope attribute (Column scope)
-                                    **(
-                                        {
-                                            "/A": pikepdf.Dictionary(
-                                                {
-                                                    "/O": pikepdf.Name("/Table"),
-                                                    "/Scope": pikepdf.Name("/Column"),
-                                                }
-                                            )
-                                        }
-                                        if row_data["is_header"]
-                                        else {}
-                                    ),
+                                    "/O": pikepdf.Name("/Table"),
+                                    "/Scope": pikepdf.Name("/Column"),
                                 }
                             )
-                        )
+
+                        cell_elem = pdf.make_indirect(pikepdf.Dictionary(cell_dict))
                         row_cells.append(cell_elem)
+
+                        # Track cell struct elem for ParentTree mapping
+                        if cell_mcid_infos:
+                            for info in cell_mcid_infos:
+                                mcid_to_struct_elem[info["mcid"]] = cell_elem
 
                     # Create TR (table row) containing the cells
                     tr_elem = pdf.make_indirect(
@@ -904,38 +2151,115 @@ def make_accessible(
                             }
                         )
                     )
-                    # Set parent reference for cells
+                    # Set parent reference for cells (will update to THead/TBody later)
                     for cell in row_cells:
                         cell["/P"] = tr_elem
-                    table_rows.append(tr_elem)
 
-                # Create Table element containing the rows
-                if table_rows:
+                    # Add to header or body rows
+                    if row_data["is_header"]:
+                        header_rows.append(tr_elem)
+                    else:
+                        body_rows.append(tr_elem)
+
+                # Create Table element with THead and TBody children
+                if header_rows or body_rows:
+                    # Generate table summary from header row
+                    header_cells = (
+                        table_data["rows"][0]["cells"] if table_data["rows"] else []
+                    )
+                    if header_cells:
+                        summary = f"Table with {table_data['row_count']} rows and {table_data['col_count']} columns. Columns: {', '.join(str(c) for c in header_cells if c)}"
+                    else:
+                        summary = f"Table with {table_data['row_count']} rows and {table_data['col_count']} columns"
+
+                    table_children = []
+
+                    # Create THead if there are header rows
+                    if header_rows:
+                        thead_elem = pdf.make_indirect(
+                            pikepdf.Dictionary(
+                                {
+                                    "/Type": pikepdf.Name("/StructElem"),
+                                    "/S": pikepdf.Name("/THead"),
+                                    "/Pg": page.obj,
+                                    "/K": pikepdf.Array(header_rows),
+                                }
+                            )
+                        )
+                        # Set parent reference for header TRs
+                        for tr in header_rows:
+                            tr["/P"] = thead_elem
+                        table_children.append(thead_elem)
+
+                    # Create TBody if there are body rows
+                    if body_rows:
+                        tbody_elem = pdf.make_indirect(
+                            pikepdf.Dictionary(
+                                {
+                                    "/Type": pikepdf.Name("/StructElem"),
+                                    "/S": pikepdf.Name("/TBody"),
+                                    "/Pg": page.obj,
+                                    "/K": pikepdf.Array(body_rows),
+                                }
+                            )
+                        )
+                        # Set parent reference for body TRs
+                        for tr in body_rows:
+                            tr["/P"] = tbody_elem
+                        table_children.append(tbody_elem)
+
                     table_elem = pdf.make_indirect(
                         pikepdf.Dictionary(
                             {
                                 "/Type": pikepdf.Name("/StructElem"),
                                 "/S": pikepdf.Name("/Table"),
                                 "/Pg": page.obj,
-                                "/K": pikepdf.Array(table_rows),
+                                "/K": pikepdf.Array(table_children),
+                                "/Summary": pikepdf.String(summary),
                             }
                         )
                     )
-                    # Set parent reference for rows
-                    for tr in table_rows:
-                        tr["/P"] = table_elem
+                    # Set parent reference for THead/TBody
+                    for child in table_children:
+                        child["/P"] = table_elem
 
                     all_struct_elems.append(table_elem)
 
+            # Build ParentTree array: index = MCID, value = struct elem ref
+            max_mcid = max((info["mcid"] for info in mcid_info), default=-1)
+            parent_tree_array = [None] * (max_mcid + 1)
+
+            # Fill in from our mcid_to_struct_elem mapping
+            for mcid, struct_elem in mcid_to_struct_elem.items():
+                if mcid < len(parent_tree_array):
+                    parent_tree_array[mcid] = struct_elem
+
             # Add to ParentTree: page_num -> array of struct elems by MCID order
-            if page_struct_elems:
+            valid_entries = [e for e in parent_tree_array if e is not None]
+            if valid_entries:
                 parent_tree_nums.append(page_num)
-                parent_tree_nums.append(pikepdf.Array(page_struct_elems))
+                parent_tree_nums.append(pikepdf.Array(parent_tree_array))
 
             # Set tab order to follow structure (required for PDF/UA)
             page.Tabs = pikepdf.Name("/S")
             # Link page to its ParentTree entry
             page.StructParents = page_num
+
+            # Build map from link_index to MCID and struct elem for this page
+            link_mcid_map = {}  # link_index -> (mcid, struct_elem)
+            for info in mcid_info:
+                if "link_index" in info:
+                    link_mcid_map[info["link_index"]] = (
+                        info["mcid"],
+                        mcid_to_struct_elem.get(info["mcid"]),
+                    )
+
+            # Get page height for coordinate conversion (PDF Y is from bottom)
+            page_mediabox = page.get("/MediaBox")
+            if page_mediabox:
+                page_height = float(page_mediabox[3]) - float(page_mediabox[1])
+            else:
+                page_height = 842.0  # Default A4 height
 
             # Handle annotations (links, form fields, etc.)
             annots = page.get("/Annots")
@@ -948,18 +2272,61 @@ def make_accessible(
                     # Create a Link structure element for this annotation
                     annot_subtype = str(annot.get("/Subtype", ""))
                     if "Link" in annot_subtype:
+                        # Convert pikepdf Rect to PyMuPDF coordinates to match page_links
+                        annot_rect = annot.get("/Rect")
+                        if annot_rect:
+                            # PDF coords: (x0, y0_bottom, x1, y1_bottom)
+                            # PyMuPDF coords: (x0, y0_top, x1, y1_top)
+                            annot_bbox_pymupdf = (
+                                float(annot_rect[0]),
+                                page_height - float(annot_rect[3]),
+                                float(annot_rect[2]),
+                                page_height - float(annot_rect[1]),
+                            )
+                        else:
+                            annot_bbox_pymupdf = None
+
+                        # Find matching link_index from page_links by bbox overlap
+                        matched_link_index = None
+                        if annot_bbox_pymupdf:
+                            for link_idx, page_link in enumerate(page_links):
+                                link_bbox = page_link.get("bbox")
+                                if link_bbox and boxes_overlap(
+                                    annot_bbox_pymupdf, link_bbox, tolerance=5.0
+                                ):
+                                    matched_link_index = link_idx
+                                    break
+
+                        # Get MCID for link text if we found a match
+                        link_text_mcid = None
+                        if (
+                            matched_link_index is not None
+                            and matched_link_index in link_mcid_map
+                        ):
+                            link_text_mcid, _ = link_mcid_map[matched_link_index]
+
+                        # Create Link structure with both MCID (text) and OBJR (annotation)
+                        objr = pikepdf.Dictionary(
+                            {
+                                "/Type": pikepdf.Name("/OBJR"),
+                                "/Obj": annot,
+                            }
+                        )
+
+                        if link_text_mcid is not None:
+                            # Include both the text MCID and the annotation OBJR
+                            k_value = pikepdf.Array([link_text_mcid, objr])
+                        else:
+                            # Fallback: only OBJR (no matching text found)
+                            k_value = objr
+
                         link_elem = pdf.make_indirect(
                             pikepdf.Dictionary(
                                 {
                                     "/Type": pikepdf.Name("/StructElem"),
                                     "/S": pikepdf.Name("/Link"),
                                     "/Pg": page.obj,
-                                    "/K": pikepdf.Dictionary(
-                                        {
-                                            "/Type": pikepdf.Name("/OBJR"),
-                                            "/Obj": annot,
-                                        }
-                                    ),
+                                    "/K": k_value,
                                 }
                             )
                         )
@@ -992,25 +2359,11 @@ def make_accessible(
             pikepdf.Dictionary({"/Nums": pikepdf.Array(parent_tree_nums)})
         )
 
-        # Create RoleMap to map our tags to standard PDF structure types
-        # This ensures compatibility with various PDF readers
-        role_map = pdf.make_indirect(
-            pikepdf.Dictionary(
-                {
-                    "/Document": pikepdf.Name("/Document"),
-                    "/H1": pikepdf.Name("/H1"),
-                    "/H2": pikepdf.Name("/H2"),
-                    "/H3": pikepdf.Name("/H3"),
-                    "/P": pikepdf.Name("/P"),
-                    "/Figure": pikepdf.Name("/Figure"),
-                    "/Link": pikepdf.Name("/Link"),
-                    "/Table": pikepdf.Name("/Table"),
-                    "/TR": pikepdf.Name("/TR"),
-                    "/TH": pikepdf.Name("/TH"),
-                    "/TD": pikepdf.Name("/TD"),
-                }
-            )
-        )
+        # Create RoleMap - only needed for custom (non-standard) tags
+        # Standard PDF 1.7 tags (Document, H1-H6, P, Figure, Table, TR, TH, TD, etc.)
+        # do NOT need role mapping - they're already recognized.
+        # An empty RoleMap is valid and preferred when using only standard tags.
+        role_map = pdf.make_indirect(pikepdf.Dictionary({}))
 
         # Create StructTreeRoot
         struct_tree_root = pdf.make_indirect(
@@ -1027,6 +2380,10 @@ def make_accessible(
 
         doc_elem["/P"] = struct_tree_root
         pdf.Root.StructTreeRoot = struct_tree_root
+
+        # Generate bookmarks from content analysis if missing
+        if not has_bookmarks:
+            generate_bookmarks_from_analysis(pdf, analysis)
 
         pdf.save(str(output_path))
 
@@ -1058,24 +2415,17 @@ def process_pdf(input_path: Path, force: bool = False) -> int:
     has_title = flags.get("title", False)
     has_display_title = flags.get("display_title", False)
 
-    # Preserve existing structure if:
-    # - PDF has MCIDs (fully tagged), OR
-    # - PDF is tagged and has figures with alt text (partial tagging, e.g., Pages export)
+    # Preserve existing structure if PDF is already tagged
+    # This avoids destroying well-structured content from apps like Pages, Word, etc.
     # Use --force to override and rebuild from scratch
-    has_existing_alt_text = pre_results.get("figures_with_alt", 0) > 0
-    preserve_structure = (
-        has_mcids or (has_tagged and has_existing_alt_text)
-    ) and not force
+    preserve_structure = has_tagged and not force
 
     # Report current status
     if pre_results["summary"]["failed"] == 0 and pre_results["summary"]["warned"] == 0:
         print("  ✓ PDF is already fully accessible!")
     else:
         if preserve_structure:
-            if has_mcids:
-                print("  ✓ Has MCIDs (preserving existing structure)")
-            elif has_existing_alt_text:
-                print("  ✓ Has existing alt text (preserving existing structure)")
+            print("  ✓ PDF is tagged (preserving existing structure)")
         if has_lang:
             print("  ✓ Has language set")
         if has_title:
@@ -1097,11 +2447,12 @@ def process_pdf(input_path: Path, force: bool = False) -> int:
         print("  - Setting document language (en-US)")
 
     try:
-        title = make_accessible(
+        title = remediate_pdf(
             str(input_path),
             str(output_path),
             analysis,
             preserve_structure=preserve_structure,
+            diagnostic=pre_results,
         )
     except Exception as e:
         print(f"Error making document accessible: {e}")
@@ -1274,19 +2625,124 @@ def gather_accessibility_info(pdf_path: Path) -> Dict[str, Any]:
         results["flags"]["display_title"] = False
 
     # === Fonts ===
-    fonts_checked = 0
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        font_list = page.get_fonts()
-        for font in font_list:
-            fonts_checked += 1
-            # font[4] is the font type - if it contains "Type3" or encoding issues, might be problematic
-            # font[3] is the encoding
-            # For embedded fonts, we'd need deeper inspection, but basic check:
-            # If font name starts with a tag like ABCDEF+, it's usually subset embedded
+    # PDF/UA requires:
+    # 1. All fonts must be embedded (or be one of the 14 standard fonts with proper encoding)
+    # 2. Fonts must have ToUnicode CMap or be symbolic fonts
+    # 3. No Type3 fonts (generally)
+    font_issues = []
+    fonts_by_name: Dict[str, Dict] = {}  # Track unique fonts
 
-    if fonts_checked > 0:
-        add_check("info", "Fonts", f"Found {fonts_checked} font references")
+    # Standard Type1 fonts that don't need embedding (but need proper encoding)
+    STANDARD_14_FONTS = {
+        "Courier",
+        "Courier-Bold",
+        "Courier-Oblique",
+        "Courier-BoldOblique",
+        "Helvetica",
+        "Helvetica-Bold",
+        "Helvetica-Oblique",
+        "Helvetica-BoldOblique",
+        "Times-Roman",
+        "Times-Bold",
+        "Times-Italic",
+        "Times-BoldItalic",
+        "Symbol",
+        "ZapfDingbats",
+    }
+
+    # Symbolic fonts that don't need ToUnicode
+    SYMBOLIC_FONTS = {"Symbol", "ZapfDingbats"}
+
+    for page_num, page in enumerate(pdf.pages):
+        resources = page.get("/Resources")
+        if not resources:
+            continue
+        fonts = resources.get("/Font")
+        if not fonts:
+            continue
+
+        for font_name, font_ref in fonts.items():
+            try:
+                font = font_ref
+                base_font = str(font.get("/BaseFont", "")).lstrip("/")
+                subtype = str(font.get("/Subtype", "")).lstrip("/")
+                encoding = font.get("/Encoding")
+                to_unicode = font.get("/ToUnicode")
+                font_descriptor = font.get("/FontDescriptor")
+
+                # Skip if we've already checked this font
+                if base_font in fonts_by_name:
+                    continue
+
+                font_info = {
+                    "base_font": base_font,
+                    "subtype": subtype,
+                    "has_encoding": encoding is not None,
+                    "has_tounicode": to_unicode is not None,
+                    "has_descriptor": font_descriptor is not None,
+                    "is_embedded": False,
+                    "is_standard": False,
+                    "is_symbolic": False,
+                    "issues": [],
+                }
+
+                # Check if it's a standard font
+                # Strip subset prefix (e.g., "ABCDEF+Helvetica" -> "Helvetica")
+                clean_name = base_font.split("+")[-1] if "+" in base_font else base_font
+                font_info["is_standard"] = clean_name in STANDARD_14_FONTS
+                font_info["is_symbolic"] = clean_name in SYMBOLIC_FONTS
+
+                # Check for embedding
+                if font_descriptor:
+                    has_fontfile = (
+                        font_descriptor.get("/FontFile") is not None
+                        or font_descriptor.get("/FontFile2") is not None
+                        or font_descriptor.get("/FontFile3") is not None
+                    )
+                    font_info["is_embedded"] = has_fontfile
+
+                # Check for Type3 fonts (problematic for accessibility)
+                if subtype == "Type3":
+                    font_info["issues"].append(
+                        "Type3 font (may cause accessibility issues)"
+                    )
+
+                # Check ToUnicode for non-symbolic fonts
+                if not font_info["is_symbolic"] and not to_unicode:
+                    # Standard fonts with WinAnsiEncoding are usually OK
+                    if font_info["is_standard"] and str(encoding) == "/WinAnsiEncoding":
+                        pass  # OK - standard encoding is mappable
+                    else:
+                        font_info["issues"].append(
+                            "Missing ToUnicode CMap (text may not be extractable)"
+                        )
+
+                # Check embedding for non-standard fonts
+                if not font_info["is_standard"] and not font_info["is_embedded"]:
+                    font_info["issues"].append(
+                        "Not embedded (may not display correctly)"
+                    )
+
+                fonts_by_name[base_font] = font_info
+
+            except Exception:
+                continue
+
+    # Report font findings
+    results["fonts"] = fonts_by_name
+    total_fonts = len(fonts_by_name)
+    fonts_with_issues = [f for f, info in fonts_by_name.items() if info["issues"]]
+
+    if total_fonts > 0:
+        add_check("info", "Fonts", f"Found {total_fonts} unique font(s)")
+
+        if fonts_with_issues:
+            for font_name in fonts_with_issues:
+                info = fonts_by_name[font_name]
+                for issue in info["issues"]:
+                    add_check("warn", "Fonts", f"{font_name}: {issue}")
+        else:
+            add_check("pass", "Fonts", "All fonts appear PDF/UA compliant")
 
     # === Structure ===
     tag_counts: Dict[str, int] = {}
@@ -1403,6 +2859,27 @@ def gather_accessibility_info(pdf_path: Path) -> Dict[str, Any]:
             "warn", "Advanced (PDF/UA)", "No MCIDs found (tags not linked to content)"
         )
 
+    # Check for empty marked content blocks (PDF/UA Content compliance)
+    empty_content_blocks = _count_empty_marked_content(pdf)
+    results["empty_content_blocks"] = empty_content_blocks
+    if empty_content_blocks > 0:
+        add_check(
+            "fail",
+            "Advanced (PDF/UA)",
+            f"Empty marked content: {empty_content_blocks} blocks have MCIDs but no content",
+        )
+
+    # Check for untagged graphics (table borders, decorative lines, etc.)
+    untagged_graphics = _count_untagged_graphics(pdf)
+    results["untagged_graphics"] = untagged_graphics
+    if untagged_graphics["total"] > 0:
+        pages_affected = len(untagged_graphics["by_page"])
+        add_check(
+            "fail",
+            "Advanced (PDF/UA)",
+            f"Untagged graphics: {untagged_graphics['total']} graphics not marked as Artifact ({pages_affected} page(s))",
+        )
+
     if mark_info:
         suspects = mark_info.get("/Suspects")
         if not suspects:
@@ -1433,6 +2910,106 @@ def gather_accessibility_info(pdf_path: Path) -> Dict[str, Any]:
     else:
         add_check("fail", "Advanced (PDF/UA)", "Tab order: Not set")
         results["flags"]["tab_order"] = False
+
+    # === Deep Structure Analysis (Matterhorn Protocol checks) ===
+    if struct_tree:
+        deep_analysis = _analyze_structure_deeply(struct_tree, pdf)
+        results["deep_analysis"] = deep_analysis
+
+        # Heading hierarchy checks
+        if deep_analysis["heading_hierarchy_issues"]:
+            for issue in deep_analysis["heading_hierarchy_issues"]:
+                add_check("warn", "Headings", f"Hierarchy issue: {issue}")
+        elif deep_analysis["headings"]:
+            add_check(
+                "pass",
+                "Headings",
+                f"Heading hierarchy: OK ({len(deep_analysis['headings'])} headings)",
+            )
+        else:
+            add_check("warn", "Headings", "No headings found in document")
+
+        # List structure checks
+        if deep_analysis["lists"]["count"] > 0:
+            if deep_analysis["lists"]["malformed"]:
+                for issue in deep_analysis["lists"]["malformed"][:3]:  # Limit to 3
+                    add_check("warn", "Lists", f"Structure issue: {issue}")
+            else:
+                add_check(
+                    "pass",
+                    "Lists",
+                    f"List structure: OK ({deep_analysis['lists']['count']} lists)",
+                )
+
+        # Table structure checks
+        if deep_analysis["tables"]["count"] > 0:
+            if deep_analysis["tables"]["without_headers"] > 0:
+                add_check(
+                    "warn",
+                    "Tables",
+                    f"{deep_analysis['tables']['without_headers']} table(s) without header cells",
+                )
+            if deep_analysis["tables"]["with_headers"] > 0:
+                add_check(
+                    "pass",
+                    "Tables",
+                    f"{deep_analysis['tables']['with_headers']} table(s) with proper headers",
+                )
+
+        # Link completeness checks
+        if deep_analysis["links"]["count"] > 0:
+            if deep_analysis["links"]["objr_only"] > 0:
+                add_check(
+                    "warn",
+                    "Links",
+                    f"{deep_analysis['links']['objr_only']} link(s) missing text content",
+                )
+            if deep_analysis["links"]["with_content"] > 0:
+                add_check(
+                    "pass",
+                    "Links",
+                    f"{deep_analysis['links']['with_content']} link(s) properly tagged",
+                )
+
+        # Document tag check
+        if not deep_analysis["has_document_tag"]:
+            add_check("warn", "Document Structure", "No Document root tag found")
+
+        # RoleMap check
+        if not deep_analysis["has_rolemap"] and deep_analysis["custom_roles"]:
+            add_check(
+                "warn",
+                "Document Structure",
+                f"Custom roles without RoleMap: {', '.join(deep_analysis['custom_roles'][:5])}",
+            )
+
+    # === Bookmarks/Outline check ===
+    bookmark_info = _check_bookmarks(pdf)
+    results["bookmarks"] = bookmark_info
+
+    if bookmark_info["has_bookmarks"]:
+        add_check(
+            "pass",
+            "Navigation",
+            f"Bookmarks: Present ({bookmark_info['bookmark_count']} entries)",
+        )
+    else:
+        # Only warn if document has headings (should have matching bookmarks)
+        if struct_tree and tag_counts.get("H1", 0) + tag_counts.get("H2", 0) > 0:
+            add_check(
+                "warn",
+                "Navigation",
+                "No bookmarks (document has headings that could be bookmarked)",
+            )
+
+    # === Metadata consistency check ===
+    metadata_info = _check_metadata_consistency(pdf)
+    results["metadata"] = metadata_info
+
+    if metadata_info["title_mismatch"]:
+        add_check(
+            "warn", "Metadata", "Title mismatch between document info and XMP metadata"
+        )
 
     doc.close()
     pdf.close()
