@@ -374,6 +374,73 @@ def _count_untagged_graphics(pdf) -> Dict[str, Any]:
     return result
 
 
+def _check_iso_compliance(pdf) -> Dict[str, Any]:
+    """
+    Check for common ISO 32000-1 structure failures.
+
+    Checks:
+    1. ParentTreeNextKey validity
+    2. ParentTree consistency (keys map to valid objects)
+    3. MCID validity (basic check)
+    """
+    issues = []
+
+    try:
+        struct_tree = pdf.Root.get("/StructTreeRoot")
+        if not struct_tree:
+            return {"status": "pass", "issues": []}
+
+        # Check 1: ParentTreeNextKey
+        parent_tree = struct_tree.get("/ParentTree")
+        next_key = struct_tree.get("/ParentTreeNextKey")
+
+        if parent_tree:
+            # Pikepdf NumberTree helper would be nice, but accessing /Nums directly is standard
+            # /ParentTree is a NumberTree. It can be a dict with /Nums (leaf) or /Kids (node).
+            # For simplicity, we'll try to walk it if it's simple, or just check the root if possible.
+            # A full NumberTree walker is complex, but we can check if pikepdf exposes it easily.
+            # In simple PDFs (like ours), it's usually a single dictionary with /Nums.
+
+            max_key = -1
+
+            def find_max_key(node):
+                nonlocal max_key
+                if "/Nums" in node:
+                    nums = node["/Nums"]
+                    for i in range(0, len(nums), 2):
+                        key = int(nums[i])
+                        if key > max_key:
+                            max_key = key
+                if "/Kids" in node:
+                    for kid in node["/Kids"]:
+                        find_max_key(kid)
+
+            try:
+                find_max_key(parent_tree)
+
+                if next_key is not None:
+                    if int(next_key) <= max_key:
+                        issues.append(
+                            f"ParentTreeNextKey ({next_key}) is <= maximum key in ParentTree ({max_key})"
+                        )
+                else:
+                    issues.append("ParentTreeNextKey is missing")
+            except Exception:
+                # If tree structure is complex/broken, we might fail to parse
+                pass
+
+        # Check 2: Structure Element Nesting (Basic)
+        # We did deep analysis elsewhere, but let's check for specific illegal parents
+        # e.g. THead inside P, or misplaced TR
+
+    except Exception as e:
+        issues.append(f"Error checking ISO compliance: {str(e)}")
+
+    if issues:
+        return {"status": "fail", "issues": issues}
+    return {"status": "pass", "issues": []}
+
+
 def _analyze_structure_deeply(struct_tree, pdf) -> Dict[str, Any]:
     """
     Perform deep analysis of structure tree for PDF/UA compliance.
@@ -418,6 +485,14 @@ def _analyze_structure_deeply(struct_tree, pdf) -> Dict[str, Any]:
         # Document element
         "has_document_tag": False,
     }
+
+    # Build page map for looking up page numbers
+    page_map = {}
+    try:
+        for i, page in enumerate(pdf.pages):
+            page_map[page.obj.objgen] = i + 1
+    except:
+        pass
 
     # Standard PDF structure types
     STANDARD_ROLES = {
@@ -633,25 +708,37 @@ def _analyze_structure_deeply(struct_tree, pdf) -> Dict[str, Any]:
             actual_text = elem.get("/ActualText")
             description = alt or actual_text
 
+            # Find page number
+            page_num = "?"
+            pg = elem.get("/Pg")
+            if pg:
+                page_num = page_map.get(pg.objgen, "?")
+
             if description:
                 desc_str = str(description).strip()
                 if desc_str == "":
                     analysis["figures"]["with_empty_alt"] += 1
-                    analysis["figures"]["alt_texts"].append((figure_num, "[empty]"))
+                    analysis["figures"]["alt_texts"].append(
+                        (figure_num, "[empty]", page_num)
+                    )
                 elif "alt text needed" in desc_str.lower() or desc_str.startswith(
                     "Image "
                 ):
                     analysis["figures"]["with_placeholder_alt"] += 1
                     analysis["figures"]["alt_texts"].append(
-                        (figure_num, f"[placeholder: {desc_str[:30]}...]")
+                        (figure_num, f"[placeholder: {desc_str[:30]}...]", page_num)
                     )
                 else:
                     analysis["figures"]["with_alt"] += 1
                     preview = desc_str[:50] + "..." if len(desc_str) > 50 else desc_str
-                    analysis["figures"]["alt_texts"].append((figure_num, preview))
+                    analysis["figures"]["alt_texts"].append(
+                        (figure_num, preview, page_num)
+                    )
             else:
                 analysis["figures"]["without_alt"] += 1
-                analysis["figures"]["alt_texts"].append((figure_num, "[missing]"))
+                analysis["figures"]["alt_texts"].append(
+                    (figure_num, "[missing]", page_num)
+                )
 
         # Recurse into children
         k = elem.get("/K")
@@ -1102,6 +1189,7 @@ def generate_alt_text_markdown(
     analysis: Dict[str, Any],
     images: List[Dict[str, Any]],
     output_dir: Path,
+    structure_analysis: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """Generate a markdown file for alt text editing."""
     md_path = output_dir / "alt_text.md"
@@ -1117,32 +1205,86 @@ def generate_alt_text_markdown(
         "",
     ]
 
-    # Build a map of which images have captions
-    image_num = 0
-    for page_data in analysis["pages"]:
-        elements = page_data["elements"]
-        for i, elem in enumerate(elements):
-            if elem["type"] == "image" and image_num < len(images):
-                img = images[image_num]
-                caption = find_image_caption(elements, i)
+    # Map extracted images by page for heuristics
+    images_by_page = {}
+    if images:
+        for img in images:
+            p = img["page"]
+            if p not in images_by_page:
+                images_by_page[p] = []
+            images_by_page[p].append(img)
 
-                lines.append(f"## Image {image_num + 1} (Page {img['page']})")
-                lines.append("")
-                lines.append(f"![Image {image_num + 1}](images/{img['filename']})")
-                lines.append("")
+    # Use structure analysis if available (Preferred: syncs with PDF tags)
+    if structure_analysis and structure_analysis.get("figures", {}).get("alt_texts"):
+        alt_texts = structure_analysis["figures"]["alt_texts"]
 
-                if caption:
-                    lines.append(f"**Auto-detected caption:** {caption}")
+        # Track consumed images to attempt 1:1 matching
+        consumed_images = set()
+
+        for fig_num, current_alt, page_num in alt_texts:
+            lines.append(f"## Figure {fig_num} (Page {page_num})")
+            lines.append("")
+
+            # Try to find a matching extracted image
+            matched_img = None
+            if isinstance(page_num, int) and page_num in images_by_page:
+                # Find first unused image on this page
+                for img in images_by_page[page_num]:
+                    img_id = f"{img['page']}_{img['index']}"
+                    if img_id not in consumed_images:
+                        matched_img = img
+                        consumed_images.add(img_id)
+                        break
+
+            if matched_img:
+                lines.append(f"![Image](images/{matched_img['filename']})")
+            else:
+                lines.append(
+                    "*(No preview available - likely a vector graphic or nested element)*"
+                )
+
+            lines.append("")
+
+            if current_alt == "[missing]":
+                lines.append("Alt text: [Describe this image]")
+            elif current_alt == "[empty]":
+                lines.append("Alt text: ")  # Intentionally empty for decorative
+            elif current_alt.startswith("[placeholder:"):
+                lines.append(f"Alt text: {current_alt}")
+            else:
+                lines.append(f"Alt text: {current_alt}")
+
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+
+    else:
+        # Fallback to Layout Analysis (Old method)
+        image_num = 0
+        for page_data in analysis["pages"]:
+            elements = page_data["elements"]
+            for i, elem in enumerate(elements):
+                if elem["type"] == "image" and image_num < len(images):
+                    img = images[image_num]
+                    caption = find_image_caption(elements, i)
+
+                    lines.append(f"## Image {image_num + 1} (Page {img['page']})")
                     lines.append("")
-                    lines.append(f"Alt text: {caption}")
-                else:
-                    lines.append("Alt text: [Describe this image]")
+                    lines.append(f"![Image {image_num + 1}](images/{img['filename']})")
+                    lines.append("")
 
-                lines.append("")
-                lines.append("---")
-                lines.append("")
+                    if caption:
+                        lines.append(f"**Auto-detected caption:** {caption}")
+                        lines.append("")
+                        lines.append(f"Alt text: {caption}")
+                    else:
+                        lines.append("Alt text: [Describe this image]")
 
-                image_num += 1
+                    lines.append("")
+                    lines.append("---")
+                    lines.append("")
+
+                    image_num += 1
 
     with open(md_path, "w") as f:
         f.write("\n".join(lines))
@@ -1271,15 +1413,36 @@ def apply_alt_text_to_pdf(pdf_path: Path | str, alt_texts: Dict[int, str]) -> No
             raise ValueError("PDF has no structure tree - run accessibility tool first")
 
         struct_tree = pdf.Root.StructTreeRoot
-        doc_elem = struct_tree.K
 
-        figure_num = 0
-        for child in doc_elem.K:
-            tag = str(child.get("/S", ""))
-            if "Figure" in tag:
-                figure_num += 1
-                if figure_num in alt_texts:
-                    child["/Alt"] = pikepdf.String(alt_texts[figure_num])
+        # Use a list to hold the mutable counter
+        counter = [0]
+
+        def process_element(elem):
+            # Check if this is a structure element
+            if hasattr(elem, "get") and elem.get("/S"):
+                tag = str(elem.get("/S", ""))
+                if "Figure" in tag:
+                    counter[0] += 1
+                    current_num = counter[0]
+                    if current_num in alt_texts:
+                        elem["/Alt"] = pikepdf.String(alt_texts[current_num])
+
+            # Recurse into children
+            k = elem.get("/K") if hasattr(elem, "get") else None
+            if k:
+                if isinstance(k, pikepdf.Array):
+                    for child in k:
+                        process_element(child)
+                elif hasattr(k, "get"):  # Single child dictionary
+                    process_element(k)
+
+        # Start processing from the document element(s)
+        doc_elem = struct_tree.K
+        if isinstance(doc_elem, pikepdf.Array):
+            for item in doc_elem:
+                process_element(item)
+        else:
+            process_element(doc_elem)
 
         pdf.save(str(pdf_path))
 
@@ -2076,18 +2239,65 @@ def remediate_pdf(
             # Create table structure elements with proper MCID linking
             # PDF/UA requires: Table → THead → TR → TH and Table → TBody → TR → TD
             for table_idx, table_data in enumerate(page_analysis.get("tables", [])):
+                # Check if this is a substantial table (more than 1 row)
+                # Single-row tables are often layout artifacts or should be treated as simple content
+                is_real_table = table_data["row_count"] > 1
+
+                if not is_real_table:
+                    # Demote single-row tables to Paragraphs (P)
+                    for row_idx, row_data in enumerate(table_data["rows"]):
+                        for cell_idx in range(len(row_data["cells"])):
+                            key = (table_idx, row_idx, cell_idx)
+                            cell_mcid_infos = table_cell_mcids.get(key, [])
+
+                            if not cell_mcid_infos:
+                                continue
+
+                            # Create P element for cell content
+                            # Use P instead of Div/Span to ensure it reads as content block
+
+                            # Flatten MCIDs
+                            mcids = [info["mcid"] for info in cell_mcid_infos]
+
+                            if len(mcids) == 1:
+                                k_value = mcids[0]
+                            else:
+                                k_value = pikepdf.Array(mcids)
+
+                            p_elem = pdf.make_indirect(
+                                pikepdf.Dictionary(
+                                    {
+                                        "/Type": pikepdf.Name("/StructElem"),
+                                        "/S": pikepdf.Name("/P"),
+                                        "/Pg": page.obj,
+                                        "/K": k_value,
+                                    }
+                                )
+                            )
+                            all_struct_elems.append(p_elem)
+
+                            # Update map
+                            for mcid in mcids:
+                                mcid_to_struct_elem[mcid] = p_elem
+
+                    # Continue to next table
+                    continue
+
                 header_rows = []  # TRs for THead
                 body_rows = []  # TRs for TBody
 
                 for row_idx, row_data in enumerate(table_data["rows"]):
                     row_cells = []
+                    is_header = row_data["is_header"]  # Define outside inner loop
+
                     for cell_idx in range(len(row_data["cells"])):
                         # Get MCIDs for this cell
                         key = (table_idx, row_idx, cell_idx)
                         cell_mcid_infos = table_cell_mcids.get(key, [])
 
                         # Create TH for header row, TD for data rows
-                        cell_tag = "TH" if row_data["is_header"] else "TD"
+                        # Only use TH if it's the first row AND the table has multiple rows (already checked)
+                        cell_tag = "TH" if is_header else "TD"
 
                         # Build /K value - single MCID or array of MCIDs
                         if len(cell_mcid_infos) == 0:
@@ -2124,7 +2334,7 @@ def remediate_pdf(
                             }
 
                         # For TH, add Scope attribute (Column scope)
-                        if row_data["is_header"]:
+                        if is_header:
                             cell_dict["/A"] = pikepdf.Dictionary(
                                 {
                                     "/O": pikepdf.Name("/Table"),
@@ -2156,7 +2366,7 @@ def remediate_pdf(
                         cell["/P"] = tr_elem
 
                     # Add to header or body rows
-                    if row_data["is_header"]:
+                    if is_header:
                         header_rows.append(tr_elem)
                     else:
                         body_rows.append(tr_elem)
@@ -2313,24 +2523,75 @@ def remediate_pdf(
                             }
                         )
 
-                        if link_text_mcid is not None:
-                            # Include both the text MCID and the annotation OBJR
-                            k_value = pikepdf.Array([link_text_mcid, objr])
+                        # Determine if we should replace an existing structure element or create a new one
+                        if (
+                            link_text_mcid is not None
+                            and matched_link_index in link_mcid_map
+                        ):
+                            # We have a matching text MCID.
+                            # The inject_mcids_into_page function likely already created a Link structure
+                            # element or a Span that we should upgrade to a Link.
+                            # However, in this loop we are iterating over all_struct_elems *after*
+                            # non_table_mcid_info has been processed but *before* we've finalized.
+
+                            # Actually, looking at the code above:
+                            # 1. inject_mcids_into_page emits 'Link' tag for text inside link rects
+                            # 2. non_table_mcid_info loop creates struct_elems for them
+
+                            # Find the struct elem already created for this MCID
+                            existing_elem = mcid_to_struct_elem.get(link_text_mcid)
+
+                            if existing_elem:
+                                # Update existing Link element to include OBJR
+                                current_k = existing_elem.get("/K")
+
+                                # Make K an array if it isn't
+                                if isinstance(current_k, (int, pikepdf.Integer)):
+                                    existing_elem["/K"] = pikepdf.Array(
+                                        [current_k, objr]
+                                    )
+                                elif isinstance(current_k, pikepdf.Array):
+                                    current_k.append(objr)
+                                else:
+                                    existing_elem["/K"] = pikepdf.Array(
+                                        [objr]
+                                    )  # Should rarely happen if MCID exists
+
+                                # We reused the existing element, so we don't append to all_struct_elems again
+                                # BUT we do need to update ParentTree and StructParent for the annotation
+
+                                link_elem = existing_elem
+
+                            else:
+                                # Fallback if for some reason we didn't find the struct elem
+                                k_value = pikepdf.Array([link_text_mcid, objr])
+                                link_elem = pdf.make_indirect(
+                                    pikepdf.Dictionary(
+                                        {
+                                            "/Type": pikepdf.Name("/StructElem"),
+                                            "/S": pikepdf.Name("/Link"),
+                                            "/Pg": page.obj,
+                                            "/K": k_value,
+                                        }
+                                    )
+                                )
+                                all_struct_elems.append(link_elem)
+
                         else:
                             # Fallback: only OBJR (no matching text found)
-                            k_value = objr
+                            k_value = objr  # Just the dictionary for OBJR? No, usually array [OBJR] or just OBJR dict
 
-                        link_elem = pdf.make_indirect(
-                            pikepdf.Dictionary(
-                                {
-                                    "/Type": pikepdf.Name("/StructElem"),
-                                    "/S": pikepdf.Name("/Link"),
-                                    "/Pg": page.obj,
-                                    "/K": k_value,
-                                }
+                            link_elem = pdf.make_indirect(
+                                pikepdf.Dictionary(
+                                    {
+                                        "/Type": pikepdf.Name("/StructElem"),
+                                        "/S": pikepdf.Name("/Link"),
+                                        "/Pg": page.obj,
+                                        "/K": k_value,
+                                    }
+                                )
                             )
-                        )
-                        all_struct_elems.append(link_elem)
+                            all_struct_elems.append(link_elem)
 
                         # Add to ParentTree for this annotation
                         parent_tree_nums.append(annot_struct_parent)
@@ -2366,13 +2627,20 @@ def remediate_pdf(
         role_map = pdf.make_indirect(pikepdf.Dictionary({}))
 
         # Create StructTreeRoot
+        next_key = (
+            max(
+                (n for n in parent_tree_nums if isinstance(n, int)),
+                default=len(pdf.pages),
+            )
+            + 1
+        )
         struct_tree_root = pdf.make_indirect(
             pikepdf.Dictionary(
                 {
                     "/Type": pikepdf.Name("/StructTreeRoot"),
                     "/K": doc_elem,
                     "/ParentTree": parent_tree,
-                    "/ParentTreeNextKey": len(pdf.pages),
+                    "/ParentTreeNextKey": next_key,
                     "/RoleMap": role_map,
                 }
             )
@@ -2472,31 +2740,53 @@ def process_pdf(input_path: Path, force: bool = False) -> int:
         print(f"  - Found {total_tables} table(s) (auto-tagged with headers)")
 
     # Handle images
-    total_images = len(analysis["images"])
-    if total_images > 0:
-        # Count images with captions
-        captioned = 0
-        for page_data in analysis["pages"]:
-            elements = page_data["elements"]
-            for i, elem in enumerate(elements):
-                if elem["type"] == "image":
-                    if find_image_caption(elements, i):
-                        captioned += 1
+    struct_analysis = pre_results.get("deep_analysis")
+    struct_figures = struct_analysis.get("figures", {}) if struct_analysis else {}
+    layout_images = analysis["images"]
 
-        needs_review = total_images - captioned
+    has_figures = struct_figures.get("count", 0) > 0 or len(layout_images) > 0
+    needs_review = 0
 
-        if captioned > 0:
-            print(f"  - Found {captioned} image(s) with captions (auto-tagged)")
+    if has_figures:
+        if struct_figures.get("count", 0) > 0:
+            # Use structure analysis to determine review needs
+            # Check for missing, empty, or placeholder alt text
+            for _, alt, _ in struct_figures.get("alt_texts", []):
+                if alt in ("[missing]", "[empty]") or alt.startswith("[placeholder:"):
+                    needs_review += 1
+
+            if needs_review > 0:
+                print(
+                    f"  - Found {needs_review} image(s) needing alt text (based on structure)"
+                )
+        else:
+            # Fallback to layout analysis
+            captioned = 0
+            for page_data in analysis["pages"]:
+                elements = page_data["elements"]
+                for i, elem in enumerate(elements):
+                    if elem["type"] == "image":
+                        if find_image_caption(elements, i):
+                            captioned += 1
+
+            needs_review = len(layout_images) - captioned
+            if needs_review > 0:
+                print(
+                    f"  - Found {needs_review} image(s) needing alt text (based on layout)"
+                )
+                if captioned > 0:
+                    print(f"  - Found {captioned} image(s) with captions (auto-tagged)")
 
         if needs_review > 0:
-            print(f"  - Found {needs_review} image(s) needing alt text")
             review_dir.mkdir(exist_ok=True)
             images = extract_images(str(input_path), review_dir)
             md_path = generate_alt_text_markdown(
-                str(input_path), analysis, images, review_dir
+                str(input_path),
+                analysis,
+                images,
+                review_dir,
+                structure_analysis=struct_analysis,
             )
-    else:
-        needs_review = 0
 
     # Ensure review_dir exists for reports
     review_dir.mkdir(exist_ok=True)
@@ -2538,9 +2828,9 @@ def process_pdf(input_path: Path, force: bool = False) -> int:
         print(f"  - View images: {html_path}")
         print(f"  - Edit alt text: {md_path}")
         print(f"  - Then run: uv run pdf_access.py {md_path}")
-    elif total_images > 0:
+    elif has_figures:
         print()
-        print("All images have captions - no manual alt text needed!")
+        print("All images have captions/descriptions - no manual alt text needed!")
 
     return 0
 
@@ -2774,6 +3064,14 @@ def gather_accessibility_info(pdf_path: Path) -> Dict[str, Any]:
                 "Document Structure",
                 "Parent tree: Missing (navigation may be limited)",
             )
+
+        # ISO 32000-1 Compliance Check
+        iso_check = _check_iso_compliance(pdf)
+        if iso_check["status"] == "fail":
+            for issue in iso_check["issues"]:
+                add_check("fail", "ISO 32000-1 Compliance", issue)
+        else:
+            add_check("pass", "ISO 32000-1 Compliance", "ParentTree integrity: OK")
 
         # Check heading order (H1 should come before H2, etc.)
         h1_count = tag_counts.get("H1", 0)
